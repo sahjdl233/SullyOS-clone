@@ -103,6 +103,7 @@ import {
   resolveCompanionPortrait,
   type CompanionAvatarSource,
 } from '../utils/companionAvatar';
+import { addCompanionModelOutfit, addUploadedCompanionOutfit } from '../utils/companionWardrobe';
 type CallState = 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'ended' | 'error';
 type CallMode = 'voice' | 'video';
 type VideoCallLayout = 'stage' | 'story' | 'mini';
@@ -881,8 +882,14 @@ const CallApp: React.FC = () => {
 
   const bindVideoAvatar = (character: CharacterProfile, videoAvatar: NonNullable<CharacterProfile['videoAvatar']>) => {
     const previous = character.videoAvatar;
+    const modelPatch = previous?.format === videoAvatar.format
+      ? addCompanionModelOutfit(character, videoAvatar)
+      : {
+          videoAvatar,
+          videoAvatarWardrobe: (character.videoAvatarWardrobe || []).filter(model => model.format === videoAvatar.format),
+        };
     updateCharacter(character.id, {
-      videoAvatar,
+      ...modelPatch,
       companionAvatar: {
         version: 1,
         ...character.companionAvatar,
@@ -901,7 +908,9 @@ const CallApp: React.FC = () => {
         : `${videoAvatar.fileName} 已绑定给 ${character.name}`,
       'success',
     );
-    if (previous?.assetId !== videoAvatar.assetId) void deleteAvatarModel(previous).catch(() => { /* orphan GC can clean later */ });
+    if (previous?.assetId !== videoAvatar.assetId && previous?.format !== videoAvatar.format) {
+      void deleteAvatarModel(previous).catch(() => { /* orphan GC can clean later */ });
+    }
   };
 
   const chooseStaticAvatarImage = () => {
@@ -930,20 +939,16 @@ const CallApp: React.FC = () => {
         return removeInput();
       }
       try {
-        const previousRef = character.companionAvatar?.imageRef;
         const imageRef = await putImageBlob(file);
         updateCharacter(character.id, {
-          companionAvatar: {
-            version: 1,
-            ...character.companionAvatar,
-            source: 'upload',
+          companionAvatar: addUploadedCompanionOutfit(character.companionAvatar, {
+            id: imageRef,
             imageRef,
             fileName: file.name,
             mimeType: file.type,
             importedAt: Date.now(),
-          },
+          }),
         });
-        if (previousRef && previousRef !== imageRef) await deleteBlobRef(previousRef);
         setCallMode('video');
         if (callSetupGuideOpenRef.current) setCallSetupGuideStep('camera');
         trackEvent('导入桌面静态形象', { 格式: file.type === 'image/gif' ? 'GIF' : 'PNG' });
@@ -2646,7 +2651,13 @@ ${sentencePlan}`;
           </div>
         )}
 
-        <div className="relative z-10 h-full overflow-y-auto overscroll-contain px-5 pb-5 no-scrollbar" style={{ paddingTop: 'max(2.5rem, var(--safe-top))' }}>
+        <div
+          className="relative z-10 flex h-full min-h-0 flex-col overflow-hidden px-5"
+          style={{
+            paddingTop: 'max(2.5rem, var(--safe-top))',
+            paddingBottom: 'max(1.25rem, var(--safe-bottom, 0px))',
+          }}
+        >
           {/* header */}
           <div className="shrink-0">
             <div className="text-[10px] tracking-[0.42em] text-white/35 font-semibold">CHAT WITH</div>
@@ -2662,7 +2673,7 @@ ${sentencePlan}`;
             value={roleGroupId} onChange={(id) => { setRoleGroupId(id); setRolePage(0); }} className="mt-4 shrink-0" />
 
           {/* character cards (6 / page) */}
-          <div className="mt-4 min-h-[5rem] max-h-[15rem] overflow-y-auto no-scrollbar space-y-2.5 pr-0.5" data-testid="call-character-picker">
+          <div className="mt-4 min-h-[5rem] flex-1 overflow-y-auto overscroll-contain no-scrollbar space-y-2.5 pr-0.5" data-testid="call-character-picker">
             {pagedChars.map(char => {
               const selected = selectedCharId === char.id;
               return (
@@ -2711,7 +2722,7 @@ ${sentencePlan}`;
           )}
 
           {/* actions */}
-          <div className="pt-4 space-y-2.5">
+          <div className="shrink-0 pt-4 space-y-2.5" data-testid="call-role-actions">
             <div className="flex items-center gap-1 rounded-2xl border border-white/10 bg-black/20 p-1">
               <button
                 onClick={() => setCallMode('voice')}
@@ -3002,10 +3013,10 @@ ${sentencePlan}`;
   const latestCallBubble = bubbles[bubbles.length - 1];
   const compactVideoTranscript = callMode === 'video' && videoCallLayout === 'stage' && !videoTranscriptExpanded;
   const videoStageSize = videoCallLayout === 'stage'
-    ? 'min-h-[260px]'
+    ? 'min-h-0'
     : videoCallLayout === 'mini'
-      ? 'h-[clamp(170px,26vh,230px)] min-h-[170px]'
-      : 'h-[clamp(215px,34vh,300px)] min-h-[215px]';
+      ? 'h-[clamp(140px,26dvh,230px)] min-h-0'
+      : 'h-[clamp(170px,34dvh,300px)] min-h-0';
   const callControlSize = callMode === 'video' ? 'h-10 w-10' : 'h-14 w-14';
   return (
     <div
@@ -3042,11 +3053,11 @@ ${sentencePlan}`;
             style={{ top: p.top, left: p.left, width: p.s, height: p.s, opacity: 0.5, animationDelay: `${i * 0.4}s`, boxShadow: `0 0 6px ${accentColor}` }} />
         ))}
       </div>
-      <div className="relative z-10 flex flex-col h-full">
+      <div className="relative z-10 flex h-full min-h-0 flex-col overflow-hidden">
         {/* 键盘避让不在这里做 paddingBottom 兜底：交给全局 interactive-widget=resizes-content
             与 iOS 全屏 PWA 的 app 高度跟随可视区（见 utils/iosStandalone.ts），和聊天等其它 App 一致。 */}
       {/* top channel bar */}
-      <div className="relative px-5" style={{ paddingTop: 'max(2.25rem, var(--safe-top))' }}>
+      <div className="relative shrink-0 px-5" style={{ paddingTop: 'max(2.25rem, var(--safe-top))' }}>
         <div className="absolute left-5 leading-tight" style={{ top: 'max(2.25rem, var(--safe-top))' }}>
           <div className="text-[9px] tracking-[0.28em] text-white/45 font-semibold">{callMode === 'video' ? 'SULLYOS · VIDEO DATE' : 'PRIVATE CHANNEL'}</div>
           <div className="mt-1.5 flex items-center gap-1.5 text-[8px] tracking-[0.22em] text-white/35">
@@ -3110,10 +3121,11 @@ ${sentencePlan}`;
           {userCameraMode === 'off' && <span className="pointer-events-none absolute right-3 top-3 z-20 h-8 w-8 rounded-tr-[1.8rem] border-r border-t" style={{ borderColor: `${accentColor}aa` }} aria-hidden />}
           <span className="pointer-events-none absolute bottom-3 left-3 z-20 text-[8px]" style={{ color: accentColor }} aria-hidden>✦</span>
           <span className="pointer-events-none absolute bottom-3 right-3 z-20 text-[7px] text-white/55" aria-hidden>✦</span>
+          {/* The action editor owns its own WebGL preview; suspend this one. */}
           <VRMVideoCallStage
             characterName={selectedChar?.name || '未选择'}
             fallbackAvatar={selectedChar?.avatar}
-            model={selectedVisualSource === 'model' ? selectedChar?.videoAvatar : undefined}
+            model={!showLive2DSettings && selectedVisualSource === 'model' ? selectedChar?.videoAvatar : undefined}
             staticAvatarSource={staticVideoAvatarActive ? selectedVisualSource : undefined}
             staticPortraitValue={staticVideoPortrait}
             staticExpressionKey={staticVideoExpressionKey}
@@ -3354,7 +3366,7 @@ ${sentencePlan}`;
       </div>
       )}
       {showInputPanel && (
-        <div className={callMode === 'video' ? 'px-3 pb-1.5' : 'px-4 pb-2'}>
+        <div className={`shrink-0 ${callMode === 'video' ? 'px-3 pb-1.5' : 'px-4 pb-2'}`}>
           <div className={`${callMode === 'video' ? 'rounded-[1.15rem] p-1.5' : 'rounded-2xl p-2'} border border-white/12 bg-black/30 backdrop-blur-md flex gap-2 items-center`} style={{ boxShadow: `inset 0 0 20px ${accentColor}1f` }}>
             {sttSupported && (
               <button
@@ -3380,7 +3392,7 @@ ${sentencePlan}`;
           {isListening && <div className="text-[10px] text-white/40 mt-1 px-1 animate-pulse">正在聆听，点麦克风结束</div>}
         </div>
       )}
-      <div className={`${callMode === 'video' ? 'px-3 pb-2 pt-0.5' : 'px-7 pb-7 pt-1.5'}`} data-testid={callMode === 'video' ? 'video-call-compact-controls' : undefined}>
+      <div className={`shrink-0 ${callMode === 'video' ? 'px-3 pb-2 pt-0.5' : 'px-7 pb-2 pt-1.5'}`} data-testid={callMode === 'video' ? 'video-call-compact-controls' : undefined}>
         <div
           className={`${callMode === 'video' ? 'grid grid-cols-5 items-center gap-1 rounded-[1.35rem] border border-white/12 bg-black/30 px-1.5 py-1.5 backdrop-blur-xl' : 'flex items-start justify-between'}`}
           style={callMode === 'video' ? { boxShadow: `inset 0 1px 0 ${accentColor}32, 0 14px 32px rgba(0,0,0,.2)` } : undefined}

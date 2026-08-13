@@ -328,11 +328,16 @@ export interface ActiveMsg2GlobalConfig {
    */
   instantChatEnabled?: boolean;
   /**
-   * 上一次探到的「那台 Worker 真的跑得动即时对话吗」（见 ActiveMsgClient.probeInstantChatSupport）。
+   * 上一次**明确探到**的「那台 Worker 真的跑得动即时对话吗」
+   * （见 ActiveMsgClient.probeInstantChatSupportDetailed）。
    *
-   * false 时即时对话整个让位给本地生成，**用户开着也不走** —— 跑不动的 Worker 上这条路
-   * 是发一条挂一条，让位比让他对着「已开启」干等强。探测每次都会刷新它，用户更新完
-   * Worker 下一次探测自然翻回 true，不用手动去重开开关。
+   * 只有问到了答案才会写这里：200 + instantTick 写 true，200 但没有 instantTick 写 false。
+   * 网络异常、超时、401、5xx 一律不写——那些说明的是线路或配置有问题，不是这台 Worker
+   * 的能力，拿它们判死刑的话一次抖动就能把即时对话长期钉死在本地生成。
+   *
+   * false 时即时对话让位给本地生成，**用户开着也不走** —— 跑不动的 Worker 上这条路是
+   * 发一条挂一条，让位比让他对着「已开启」干等强。发消息路上会带冷却地现探一次，
+   * 用户更新完 Worker 后自己就翻回来了，不用手动去重开开关。
    *
    * undefined = 还没探过（刚装、没进过设置页），按放行处理：这一档说明我们不知道，
    * 而不是知道它不行；握手时会补探一次，之后就有准数了。
@@ -631,6 +636,14 @@ export interface CompanionAvatarConfig {
   fileName?: string;
   mimeType?: string;
   importedAt?: number;
+  /** Uploaded portraits kept in the wardrobe. The top-level image fields point at the active item. */
+  imageWardrobe?: Array<{
+    id: string;
+    imageRef: string;
+    fileName?: string;
+    mimeType?: string;
+    importedAt?: number;
+  }>;
   /** Independent from Date mode's active outfit; desktop and video calls share this selected outfit. */
   skinSetId?: string;
 }
@@ -2404,6 +2417,18 @@ export interface CharMusicProfile {
 
 export type CompanionTouchZone = 'head' | 'face' | 'hand' | 'body' | 'other';
 
+export interface AvatarTouchRegion {
+  id: string;
+  zone: CompanionTouchZone;
+  /** Regions are normalized against this Live2D model's rendered bounds, not the screen. */
+  shape: 'ellipse';
+  /** Ellipse center and size, all in model-local 0..1 coordinates. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface CompanionPerformancePrecision {
   /** Temporarily suspend ambient turns/glances and keep the authored pose authoritative. */
   lockAutonomy?: boolean;
@@ -2550,6 +2575,8 @@ export interface CharacterProfile {
       builtinModelUrl?: string;
       /** balanced = 2K 默认纹理，hd = 4K 可选纹理。 */
       builtinQuality?: 'balanced' | 'hd';
+      /** 导入模型的运行纹理档位；默认 balanced(2K)，源模型最多保留到 4K 以便切换。 */
+      textureQuality?: 'balanced' | 'hd';
       /** 内置 Sully 的一次性默认构图迁移版本。 */
       builtinFramingVersion?: 1 | 2;
       /** ZIP 包内 model3.json 的完整相对路径。 */
@@ -2557,8 +2584,8 @@ export interface CharacterProfile {
       byteLength: number;
       fileCount: number;
       importedAt: number;
-      /** 运行包已在导入时转为 STORE（免 DEFLATE 解压）的缓存格式。 */
-      runtimePackageEncoding?: 'store-v1';
+      /** 源包格式：旧模型使用 STORE，新导入 ZIP 保留原包并按文件流式读取。 */
+      runtimePackageEncoding?: 'store-v1' | 'zip-v1';
       /** 自动动作权限策略版本；2 = 安全动作默认加入 AI 动作库。 */
       actionPolicyVersion?: 2;
       /** 用户校准后的 Live2D 舞台构图；偏移量是相对画布宽高的比例。 */
@@ -2586,6 +2613,8 @@ export interface CharacterProfile {
           bottom: number;
           left: number;
       };
+      /** 用户为这个 Live2D 模型单独圈选的触摸区域；未命中时仍回退模型自己的 HitArea。 */
+      touchRegions?: AvatarTouchRegion[];
       /** model3.json Groups 中声明的口型参数；没有声明时使用标准参数。 */
       lipSyncParameterIds: string[];
       /** 每个模型自己的动作/表情权限。AI 只能调用 permission=ai 的项目。 */
@@ -2602,6 +2631,12 @@ export interface CharacterProfile {
           params?: Array<{ id: string; value: number }>;
           /** motion3/exp3 文件实际写入的参数；用于高质量模式判断能否安全并行动作。 */
           parameterIds?: string[];
+          /** exp3 参数目标；衣橱会把这些值作为持久底层，避免表情重置顺带清掉服装。 */
+          parameterValues?: Array<{
+              id: string;
+              value: number;
+              blend?: 'Add' | 'Multiply' | 'Overwrite';
+          }>;
           /** VTube Studio 中绑定的原始组合键，例如 F1 / Alt+Q。 */
           hotkey?: string;
           source?: 'model3' | 'vtube' | 'discovered' | 'custom';
@@ -2615,6 +2650,8 @@ export interface CharacterProfile {
       /** 衣橱中最后一次由用户手动选择的服装动作。 */
       activeWardrobeActionId?: string;
   };
+  /** Inactive whole-model outfits. Switching swaps one entry with videoAvatar; only matching formats are shown. */
+  videoAvatarWardrobe?: Array<NonNullable<CharacterProfile['videoAvatar']>>;
   /** Which character visual the tactile companion desktop should render. */
   companionAvatar?: CompanionAvatarConfig;
   /**
@@ -3746,6 +3783,7 @@ export interface FullBackupData {
     }[];
 
     xhsActivities?: XhsActivityRecord[];
+    xhsOwnedPosts?: XhsOwnedPost[];
     xhsStockImages?: XhsStockImage[];
 
     // Study Room settings
@@ -3923,18 +3961,39 @@ export interface XhsActivityRecord {
     timestamp: number;
     actionType: XhsActionType;
     content: {
+        noteId?: string;
         title?: string;
         body?: string;
         tags?: string[];
         keyword?: string;
         savedTopics?: { title: string; desc: string; noteId?: string }[];
         notesViewed?: { noteId: string; title: string; desc: string; author: string; likes: number }[];
-        commentTarget?: { noteId: string; title: string };
+        commentTarget?: { noteId: string; title: string; commentId?: string };
         commentText?: string;
     };
     thinking: string;  // Character's internal monologue / reasoning
     result: 'success' | 'failed' | 'skipped';
     resultMessage?: string;
+}
+
+/**
+ * 角色在共享的真实小红书账号下发布的笔记归属。
+ * 独立于可清理的活动日志，作为自由活动 App 中“角色主页”的持久化数据源。
+ */
+export interface XhsOwnedPost {
+    id: string; // `${characterId}:${noteId}`
+    characterId: string;
+    noteId: string;
+    title: string;
+    body: string;
+    tags?: string[];
+    publishedAt: number;
+    updatedAt: number;
+    xsecToken?: string;
+    likes?: number;
+    collects?: number;
+    commentCount?: number;
+    shareCount?: number;
 }
 
 export interface XhsFreeRoamSession {
