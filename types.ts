@@ -89,6 +89,20 @@ export interface ScheduleCardAppearance {
   customCss?: string;
 }
 
+export type JournalAppearancePresetId =
+  | 'original'
+  | 'letterpress'
+  | 'sakura'
+  | 'forest'
+  | 'midnight';
+
+/** 交换日记 App 的全局皮肤。预设负责开箱即用，自定义 CSS 最后注入并可覆盖预设。 */
+export interface JournalAppearance {
+  preset?: JournalAppearancePresetId;
+  /** 仅允许 .sully-journal-* 作用域，避免样式影响其它 App。 */
+  customCss?: string;
+}
+
 export interface OSTheme {
   hue: number;
   saturation: number;
@@ -124,6 +138,8 @@ export interface OSTheme {
   nowPlayingWidgetLight?: boolean;
   /** 日程卡片统一皮肤：桌面、全屏、房间与聊天内同步。 */
   scheduleCardAppearance?: ScheduleCardAppearance;
+  /** 交换日记 App 全局皮肤与自定义 CSS。 */
+  journalAppearance?: JournalAppearance;
   desktopDecorations?: DesktopDecoration[];
   customFont?: string;
   /** 顶部时间栏布局：安全显示（安全区下方）/ 紧凑显示（嵌入安全区）/ 完全隐藏。 */
@@ -232,9 +248,8 @@ export interface VirtualTime {
 
 export type MinimaxRegion = 'domestic' | 'overseas';
 
-// 语音合成（TTS）服务商。'minimax'（默认）走 MiniMax T2A；'fishaudio' 走鱼声 Fish Audio。
-// 全局二选一：切换后所有语音场景（聊天语音条 / 约会 / 电话）统一用同一家。
-export type TtsProvider = 'minimax' | 'fishaudio';
+// 语音合成（TTS）服务商。全局三选一：切换后聊天语音条 / 约会 / 电话统一用同一家。
+export type TtsProvider = 'minimax' | 'fishaudio' | 'elevenlabs';
 
 export interface VisionApiConfig {
   /** 开启后，聊天图片先由独立视觉模型转成文字，再交给主对话模型。 */
@@ -255,15 +270,24 @@ export interface APIConfig {
   // 'overseas' → https://api.minimax.io  (海外站)
   // Missing / unknown falls back to domestic.
   minimaxRegion?: MinimaxRegion;
-  // 语音服务商二选一。缺省 → 'minimax'。
+  // 语音服务商三选一。缺省 → 'minimax'。
   ttsProvider?: TtsProvider;
   // 鱼声 Fish Audio API Key（https://fish.audio/）。仅 ttsProvider === 'fishaudio' 时使用。
   fishAudioApiKey?: string;
   // 鱼声默认模型（s2.1-pro / s2-pro / s1）。缺省 → 's2.1-pro'。
   // 角色 voiceProfile.fishModel 优先于这个全局默认。
   fishAudioModel?: string;
+  // ElevenLabs BYOK 配置。Voice ID 存在角色 voiceProfile.elevenLabsVoiceId，避免角色串音色。
+  elevenLabsApiKey?: string;
+  // 缺省使用低延迟 eleven_flash_v2_5；也支持 eleven_v3 / eleven_multilingual_v2。
+  elevenLabsModel?: string;
+  // ElevenLabs Voice Settings（请求级覆盖，不修改 ElevenLabs 控制台里的音色默认值）。
+  elevenLabsStability?: number;
+  elevenLabsSimilarityBoost?: number;
+  elevenLabsStyle?: number;
+  elevenLabsUseSpeakerBoost?: boolean;
   // 用户自定义「语音表演指南」——注入到角色 system prompt、教模型怎么写出有情绪的语音台词。
-  // minimax / fishaudio：聊天 + 电话共用，按 TTS 服务商分别存（两家标记体系不同，不能共用一份）；
+  // minimax / fishaudio / elevenlabs：聊天 + 电话共用，按 TTS 服务商分别存；
   //   留空 → 用内置默认（minimaxTts.VOICE_ACTING_GUIDE / fishAudioTts.FISH_VOICE_ACTING_GUIDE）。
   // dateVoice：见面（DateApp）专用的 [v:xxx] 语音情绪规则，与服务商无关、单独一份；
   //   留空 → 用内置默认（datePrompts.DATE_VOICE_GUIDE）。
@@ -271,6 +295,7 @@ export interface APIConfig {
   voicePrompts?: {
     minimax?: string;
     fishaudio?: string;
+    elevenlabs?: string;
     dateVoice?: string;
   };
   // Replicate token (r8_xxx) for ACE-Step song generation in 写歌 App.
@@ -360,6 +385,19 @@ export interface ActiveMsg2GlobalConfig {
    * 一份凭据，也不要拿新写法去撞一台还不认识它的 Worker。握手时会探一次。
    */
   llmCredentialsSupported?: boolean;
+  /**
+   * 上一次探到的「这台 Worker 认不认 PUT /client-state 里 value: null 的删行语义」
+   * （GET /capabilities 的 features 含 'client-state-delete'，见 ActiveMsgClient.probeWorkerFeatures）。
+   *
+   * 达标时取回旁路存的大内容后把那一行真的删掉；不达标照旧写空串、留一个空壳。
+   * undefined / false 都按「不达标」处理：老 Worker 收到 null 会逐条拒掉。握手时会探一次。
+   */
+  clientStateDeleteSupported?: boolean;
+  /**
+   * 旁路存储的存量空壳已经扫过一遍的角色 id（见 activeMsgClient 的存量空壳清理）。
+   * 每个角色只扫一次：扫完记进来，之后的同步不再为它多读一次云端。
+   */
+  sidechannelShellsSweptCharIds?: string[];
   updatedAt?: number;
 }
 
@@ -2162,6 +2200,8 @@ export interface StoryTheaterPresetPrompt {
     enabled: boolean;
     role: 'system' | 'user' | 'assistant';
     content: string;
+    /** 自定义大区边界，仅用于编辑器组织，不发送给模型。 */
+    section?: { id: string; name: string; edge: 'start' | 'end' };
     /** marker 由发送器替换为角色/世界书/用户/场景/历史，不把占位条目当普通正文。 */
     marker?: 'characters' | 'world_before' | 'user' | 'world_after' | 'scenario' | 'examples' | 'history';
 }
@@ -2860,11 +2900,15 @@ export interface CharacterProfile {
   voiceProfile?: {
       provider?: 'minimax' | 'custom';
       voiceId?: string;
+      // MiniMax 合成参数版本。缺省/legacy 保持历史效果；natural-v2 需由用户主动开启。
+      minimaxParamVersion?: 'legacy' | 'natural-v2';
       // 鱼声 Fish Audio 音色：从 fish.audio 语音库复制的 reference_id。
       // 与 MiniMax 的 voiceId 不通用，单独保存，切换 provider 时各取各的。
       fishReferenceId?: string;
       // 该角色单独指定的鱼声模型（覆盖全局 fishAudioModel）。
       fishModel?: string;
+      // ElevenLabs 角色音色 ID。与 MiniMax voiceId / Fish reference_id 各存各的。
+      elevenLabsVoiceId?: string;
       voiceName?: string;
       source?: 'system' | 'voice_cloning' | 'voice_generation' | 'custom';
       model?: string;
@@ -3001,6 +3045,8 @@ export interface CharacterProfile {
    */
   htmlModeEnabled?: boolean;
   htmlModeCustomPrompt?: string;
+  /** 可选：在日常 ChatApp 注入任务优先的协同工作规则。提示词较长，默认关闭。 */
+  chatCollaborationEnabled?: boolean;
   /** 该角色专属的聊天「白框」自定义 CSS（叠加在全局 osTheme.chatChromeCustomCss 之上）。 */
   chromeCustomCss?: string;
   /** 白框「提示音」：仅当 ta 新发的消息成为会话最后一条时播放一次。src 可为内置音效 key / 音频直链 / 上传后内联的 data:audio。
@@ -3192,6 +3238,8 @@ export interface GalleryImage {
     charId: string;
     url: string;
     timestamp: number;
+    /** 原图来自聊天时指向消息主键；相册与收藏只关联，不再复制第三份图片。 */
+    sourceMessageId?: number;
     review?: string;
     reviewTimestamp?: number;
     savedDate?: string; // YYYY-MM-DD format
@@ -3731,7 +3779,7 @@ export interface GameSession {
     lastPlayedAt: number;
 }
 
-export type MessageType = 'text' | 'image' | 'emoji' | 'voice' | 'interaction' | 'transfer' | 'system' | 'social_card' | 'chat_forward' | 'xhs_card' | 'score_card' | 'music_card' | 'mcd_card' | 'luckin_card' | 'html_card' | 'news_card' | 'vr_card' | 'trpg_card' | 'novel_card' | 'world_card' | 'sim_card' | 'phone_card' | 'webpage_card' | 'theater_card' | 'room_card' | 'life_card' | 'group_topic_card';
+export type MessageType = 'text' | 'image' | 'emoji' | 'voice' | 'collaboration_file' | 'interaction' | 'transfer' | 'system' | 'social_card' | 'chat_forward' | 'xhs_card' | 'score_card' | 'music_card' | 'mcd_card' | 'luckin_card' | 'html_card' | 'news_card' | 'vr_card' | 'trpg_card' | 'novel_card' | 'world_card' | 'sim_card' | 'phone_card' | 'webpage_card' | 'theater_card' | 'room_card' | 'life_card' | 'group_topic_card';
 
 export interface Message {
     id: number;
@@ -3767,6 +3815,8 @@ export interface FullBackupData {
     version: number;
     theme?: OSTheme;
     apiConfig?: APIConfig;
+    /** 查手机 App 独立 API；null/缺省时跟随聊天默认。 */
+    checkPhoneApi?: APIConfig | null;
     instantPushConfig?: InstantPushConfig;
     pushVapid?: { vapidPublicKey: string; vapidPrivateKey: string; vapidEmail?: string; updatedAt?: number; };
     /**
@@ -3940,6 +3990,21 @@ export interface FullBackupData {
     hotNewsSnapshots?: HotNewsSnapshot[];
     dreamCollection?: Record<string, { firstAt: number; count: number }>;  // 梦境盲盒收藏册（os_dream_collection，账号级 localStorage）
     gotchiAccentHue?: string;  // 桌面电子宠物主题主色调偏好（tama_accent_hue，账号级 localStorage）
+
+    // 独立协同工作数据库。二进制文件放在 ZIP 的 collaboration/assets/，JSON 只存索引。
+    collaborationBackupVersion?: 1;
+    collaborationBackupMode?: 'text_only' | 'media_only' | 'full';
+    collaborationSessions?: any[];
+    collaborationMessages?: any[];
+    collaborationCategories?: any[];
+    collaborationSettings?: any;
+    collaborationAssetIndex?: {
+        id: string;
+        path: string;
+        mimeType: string;
+        size: number;
+        createdAt: number;
+    }[];
 }
 
 // --- CLOUD BACKUP TYPES ---
@@ -3972,8 +4037,13 @@ export interface CloudBackupConfig {
 export interface CloudBackupFile {
     name: string;
     size: number;
-    lastModified: string;       // ISO date string
+    lastModified: string | number; // ISO date string or epoch timestamp
     href: string;               // WebDAV: remote path. GitHub: 'releaseId:assetId'
+    /** GitHub can expose an interrupted draft/release without a restorable asset set. */
+    status?: 'ready' | 'incomplete';
+    statusMessage?: string;
+    /** Expected GitHub asset sizes, in the same order as the ids encoded in href. */
+    partSizes?: number[];
 }
 
 // --- GUIDEBOOK (攻略本) APP TYPES ---

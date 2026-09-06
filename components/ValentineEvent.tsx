@@ -1,3 +1,4 @@
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 /**
  * ValentineEvent.tsx
@@ -16,9 +17,7 @@ import { DB } from '../utils/db';
 import { ContextBuilder } from '../utils/context';
 import { safeResponseJson } from '../utils/safeApi';
 import { AppID, CharacterProfile, SpecialMomentRecord } from '../types';
-import { Capacitor } from '@capacitor/core';
-import { Filesystem, Directory } from '@capacitor/filesystem';
-import { Share } from '@capacitor/share';
+import { shareOrDownloadBlob } from '../utils/shareExport';
 import TokenImg from './os/TokenImg';
 import { isImageValue } from '../utils/blobRef';
 import { WhiteDaySession, isWhiteDayEventAvailable, WHITEDAY_RECORD_KEY } from './WhiteDayEvent';
@@ -522,9 +521,8 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
 
         try {
             // 获取聊天历史摘要
-            const msgs = await DB.getMessagesByCharId(cId);
-            const limit = c.contextLimit || 500;
-            const recentMsgs = msgs.slice(-Math.min(limit, 80)).map(m => {
+            const msgs = await loadCharacterContextMessages(c);
+            const recentMsgs = msgs.map(m => {
                 const content = m.type === 'image' ? '[图片]' : m.content;
                 return `${m.role}: ${content}`;
             }).join('\n');
@@ -683,27 +681,11 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
             });
             const fileName = `valentine_${char?.name || 'record'}_2026.png`;
 
-            if (Capacitor.isNativePlatform()) {
-                const dataUrl = canvas.toDataURL('image/png');
-                await Filesystem.writeFile({
-                    path: fileName,
-                    data: dataUrl,
-                    directory: Directory.Cache,
-                });
-                const uriResult = await Filesystem.getUri({
-                    directory: Directory.Cache,
-                    path: fileName,
-                });
-                await Share.share({
-                    title: '特别时光 - 导出长图',
-                    files: [uriResult.uri],
-                });
-            } else {
-                const link = document.createElement('a');
-                link.download = fileName;
-                link.href = canvas.toDataURL('image/png');
-                link.click();
-            }
+            const blob = await new Promise<Blob>((resolve, reject) => {
+                canvas.toBlob(result => result ? resolve(result) : reject(new Error('长图生成失败')), 'image/png');
+            });
+            const result = await shareOrDownloadBlob({ blob, fileName, shareTitle: '特别时光 - 导出长图' });
+            if (result === 'cancelled') return;
             addToast('导出成功', 'success');
         } catch (e: any) {
             console.error('Export failed:', e);

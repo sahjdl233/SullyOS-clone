@@ -1,3 +1,4 @@
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useOS } from '../context/OSContext';
@@ -23,6 +24,7 @@ import StoryTheater from '../components/date/story/StoryTheater';
 import { dateLaunch } from '../utils/dateLaunch';
 import { materializeVisionDescriptions } from '../utils/visionApi';
 import { shareOrDownloadFile } from '../utils/shareExport';
+import { buildInPersonContinueInstruction } from '../utils/meetingContinue';
 import {
     buildDateHistoryGroups,
     formatDateHistoryDate,
@@ -141,7 +143,6 @@ const DateApp: React.FC = () => {
         markAmsgStateDirty({ char: target, userProfile, groups, realtimeConfig });
     };
 
-    const getDateContextFetchLimit = (c: CharacterProfile) => Math.max(c.contextLimit || 500, DATE_SESSION_MESSAGE_LIMIT) + 32;
     const loadRecentDateMessages = async (charId: string, limit = DATE_SESSION_MESSAGE_LIMIT) => {
         return (await DB.getRecentMessagesByCharIdAndSource(charId, 'date', limit))
             .sort((a, b) => a.timestamp - b.timestamp);
@@ -327,7 +328,7 @@ const DateApp: React.FC = () => {
         trackEvent('进入见面感知页');
 
         try {
-            const msgs = await DB.getRecentMessagesByCharId(c.id, getDateContextFetchLimit(c), true);
+            const msgs = await loadCharacterContextMessages(c);
             const preparedMsgs = await materializeVisionDescriptions(msgs, apiConfig.visionApi);
             const emojis = await DB.getEmojis();
             const { messages } = DatePrompts.buildPeekPayload({
@@ -402,7 +403,7 @@ const DateApp: React.FC = () => {
     }, [memoryPalaceConfig, apiConfig, userProfile?.name, updateCharacter, addToast]);
 
     // --- Session API Logic ---
-    const handleSendMessage = async (text: string): Promise<string> => {
+    const handleSendMessage = async (text: string, kind?: 'continue'): Promise<string> => {
         if (!char) throw new Error("No char");
 
         // 重发场景：如果 DB 里最后一条已经是这条 user 消息（上一轮发送后 API 失败 / 网络抖动等），
@@ -412,29 +413,41 @@ const DateApp: React.FC = () => {
             && recentCheck[0].role === 'user'
             && recentCheck[0].content === text
             && recentCheck[0].metadata?.source === 'date';
+        // API 中断后的重试只会带回显示文本；从已落库标记恢复“继续”的完整语义。
+        const isContinueTurn = kind === 'continue'
+            || (isRetry && recentCheck[0].metadata?.meetingContinue === true);
 
         if (!isRetry) {
             // 1. Save User Msg
-            await DB.saveMessage({ charId: char.id, role: 'user', type: 'text', content: text, metadata: { source: 'date' } });
+            await DB.saveMessage({
+                charId: char.id,
+                role: 'user',
+                type: 'text',
+                content: text,
+                metadata: { source: 'date', ...(isContinueTurn ? { meetingContinue: true } : {}) },
+            });
             markDateTurnDirty(char);
         }
 
         // 2. Prepare Context
         // Re-fetch messages. Since we saved the opening in handleEnterSession,
         // 'allMsgs' will now correctly contain: [History..., Opening, UserMsg]
-        const allMsgs = await DB.getRecentMessagesByCharId(char.id, getDateContextFetchLimit(char), true);
+        const allMsgs = await loadCharacterContextMessages(char);
         const preparedAllMsgs = await materializeVisionDescriptions(allMsgs, apiConfig.visionApi);
 
         // Update local state for display
         setDateMessages(await loadRecentDateMessages(char.id));
 
         const emojis = await DB.getEmojis();
+        const modelText = isContinueTurn
+            ? buildInPersonContinueInstruction(userProfile?.name, char.name)
+            : text;
         const { messages } = await DatePrompts.buildSessionPayload({
             char,
             userProfile,
             allMsgs: preparedAllMsgs,
             emojis,
-            userText: text,
+            userText: modelText,
             variant: 'send',
             useVisionDescriptions: apiConfig.visionApi?.enabled === true,
         });
@@ -460,7 +473,7 @@ const DateApp: React.FC = () => {
         if (lastMsg.role !== 'assistant') throw new Error("Cannot reroll user message");
 
         // Keep the old reply until the replacement request succeeds.
-        const allMsgs = await DB.getRecentMessagesByCharId(char.id, getDateContextFetchLimit(char), true);
+        const allMsgs = await loadCharacterContextMessages(char);
         const validMsgs = allMsgs.filter(m => m.id !== lastMsg.id);
         const preparedValidMsgs = await materializeVisionDescriptions(validMsgs, apiConfig.visionApi);
         const emojis = await DB.getEmojis();

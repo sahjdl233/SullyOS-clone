@@ -4,7 +4,7 @@ import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGrou
 import { DB } from '../utils/db';
 import type { AvatarTouchRecord } from '../utils/avatarTouch';
 import { clampClaudeTemperature, modelRejectsSamplingParams, stripSamplingParams } from '../utils/samplingParamCompat';
-import { extractImagesInPlace, deepCloneForExport } from '../utils/backupExport';
+import { buildMalformedImageDiagnostics, extractImagesInPlace, deepCloneForExport, parseImageDataUrlForBackup, type BackupObjectPath, type MalformedBackupImageDiagnostic } from '../utils/backupExport';
 import { isBlobRef, getBlobForRef, restoreBlobRef, migrateDataUrlToRef, migrateAppearancePresetBlobRefs, migrateChatThemeBlobRefs, resolveBlobRefsDeep, resolveRefToDataUrl, BLOBREF_PREFIX, deleteBlobRefIfUnreferenced } from '../utils/blobRef';
 import { resolveBlobRefsInRequestBody } from '../utils/apiBlobRefs';
 import { collectBlobRefs, writeBlobsToZip, readBlobsIndex, restoreBlobsFromZip } from '../utils/backupBlobs';
@@ -34,9 +34,10 @@ import { isGlobalStreamEnabled, upgradeChatBodyToStream, assembleUpgradedRespons
 import { rewriteStaleWorkerUrl } from '../utils/proxyWorker';
 import { buildFetchFailureDetail, classifyFetchFailure, describeReachabilityProbe, parseTargetUrl, probeOriginReachability, shouldProbeReachability, summarizeFetchRequestBody } from '../utils/networkFailureDiagnosis';
 import { INSTALLED_APPS, HIDDEN_APP_NAMES } from '../constants';
-import { isAnalyticsRequestUrl, trackEvent, trackDataScaleOnce, trackCurrentAppearanceOnce, trackCurrentCharSettingsOnce, trackCurrentFeaturesOnce } from '../utils/analytics';
+import { isAnalyticsRequestUrl, trackEvent, shouldReportSnapshot, trackDataScaleOnce, trackCurrentAppearanceOnce, trackCurrentCharSettingsOnce, trackCurrentFeaturesOnce } from '../utils/analytics';
 import { collectAppearance, collectCharSettings, collectDataScale, collectFeatureFlagsAsync } from '../utils/analyticsSnapshot';
 import { normalizeApiConfig, normalizeApiPreset } from '../utils/apiConfigNormalize';
+import { getCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
 import { markBackupDone } from '../utils/backupReminder';
 import { normalizeCharacterImpression, normalizeCharacterDefaults } from '../utils/impression';
 import { normalizeModelIds } from '../utils/modelList';
@@ -66,7 +67,7 @@ import { markAmsgStateDirty, markAmsgStateDirtyForAll, resumePendingAmsgStateSyn
 import { loadMusicPlaybackSnapshot } from './MusicContext';
 import { setCharNameRegistry } from '../utils/charNameRegistry';
 import { setMinimaxRegion } from '../utils/minimaxEndpoint';
-import { setTtsProvider, setVoicePromptOverrides } from '../utils/ttsProvider';
+import { setElevenLabsModel, setTtsProvider, setVoicePromptOverrides } from '../utils/ttsProvider';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Capacitor } from '@capacitor/core';
 import { formatBytes } from '../utils/format';
@@ -373,7 +374,7 @@ interface OSContextType {
 
   // Appearance Presets
   appearancePresets: AppearancePreset[];
-  saveAppearancePreset: (name: string) => void;
+  saveAppearancePreset: (name: string, themeOverride?: OSTheme) => void;
   applyAppearancePreset: (id: string) => void;
   deleteAppearancePreset: (id: string) => void;
   renameAppearancePreset: (id: string, name: string) => void;
@@ -628,6 +629,14 @@ const defaultApiConfig: APIConfig = {
   minimaxApiKey: '',
   minimaxGroupId: '',
   minimaxRegion: 'domestic',
+  ttsProvider: 'minimax',
+  fishAudioModel: 's2.1-pro',
+  elevenLabsApiKey: '',
+  elevenLabsModel: 'eleven_flash_v2_5',
+  elevenLabsStability: 0.5,
+  elevenLabsSimilarityBoost: 0.8,
+  elevenLabsStyle: 0,
+  elevenLabsUseSpeakerBoost: false,
   model: 'gpt-4o-mini',
   stream: false,
   temperature: 0.85,
@@ -812,7 +821,15 @@ Sully是小手机的内置AI。
 // Fallback for factory reset (empty db)
 const initialCharacter = sullyV2;
 
-const OSContext = createContext<OSContextType | undefined>(undefined);
+// Vite 热更新会重新执行本模块。若此时 createContext() 产出一份新实例，而屏幕上的
+// OSProvider 还在使用更新前的实例，懒加载的 Chat 就会短暂读到 undefined 并触发整页崩溃。
+// 开发环境把 Context 本体挂在 globalThis 上保持身份稳定；正式构建仍使用普通模块单例。
+const osContextHmrGlobal = globalThis as typeof globalThis & {
+  __SULLYOS_OS_CONTEXT_HMR__?: React.Context<OSContextType | undefined>;
+};
+const OSContext = import.meta.env.DEV
+  ? (osContextHmrGlobal.__SULLYOS_OS_CONTEXT_HMR__ ??= createContext<OSContextType | undefined>(undefined))
+  : createContext<OSContextType | undefined>(undefined);
 
 export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // ... (State declarations same as before) ...
@@ -1023,6 +1040,8 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   const scaleReportedRef = useRef(false);
   useEffect(() => {
       if (!isDataLoaded || scaleReportedRef.current) return;
+      // 四组快照轮流报，这次没轮到就连取数都别跑（要读 IndexedDB）。见 utils/analytics.ts。
+      if (!shouldReportSnapshot('data-scale')) return;
       scaleReportedRef.current = true;
       void (async () => {
           trackDataScaleOnce(await collectDataScale(characters));
@@ -1034,12 +1053,13 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   // 拿来决定砍哪个预设会砍反。取数和收敛都在 utils/analyticsSnapshot.ts 里，
   // 用户自己捏的主题、字体、白框 CSS 一律收敛成 custom / 用了，不带他起的名字。
   useEffect(() => {
-      if (!isDataLoaded) return;
+      if (!isDataLoaded || !shouldReportSnapshot('appearance')) return;
       trackCurrentAppearanceOnce(collectAppearance(theme, characters.find(c => c.id === activeCharacterId)));
   }, [isDataLoaded, characters, activeCharacterId, theme]);
 
   useEffect(() => {
       if (!isDataLoaded || characters.length === 0) return;
+      if (!shouldReportSnapshot('char-settings')) return;
       trackCurrentCharSettingsOnce(collectCharSettings(characters, activeCharacterId));
   }, [isDataLoaded, characters, activeCharacterId]);
 
@@ -1049,11 +1069,12 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   //
   // 收敛全在 utils/analyticsSnapshot.ts 里做，这里只负责把 OSContext 手上那几份
   // state 递过去。地址、密钥、token、账号名一个字都不会进上报。
-  // 自己拦一道「只跑一次」：上报侧本来就有 once 门，但取数要读两次 IndexedDB
-  // （彼方独立线路、主动消息 2.0 的全局配置），让它跟着 characters 每次变更白跑不值当。
+  // 自己拦一道「只跑一次」：上报侧本来就有 once 门，但取数要读 IndexedDB
+  // （彼方独立线路、主动消息 2.0 全局配置、协同库 count），不让它随 state 变更白跑。
   const featuresReportedRef = useRef(false);
   useEffect(() => {
       if (!isDataLoaded || featuresReportedRef.current) return;
+      if (!shouldReportSnapshot('features')) return;
       featuresReportedRef.current = true;
       void (async () => {
           trackCurrentFeaturesOnce(await collectFeatureFlagsAsync({
@@ -2137,6 +2158,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   useEffect(() => {
     setTtsProvider(apiConfig.ttsProvider);
   }, [apiConfig.ttsProvider]);
+  // ElevenLabs 的 v3 与 Flash/Multilingual 使用不同的提示词标记；prompt 构建器靠单例读当前模型。
+  useEffect(() => {
+    setElevenLabsModel(apiConfig.elevenLabsModel);
+  }, [apiConfig.elevenLabsModel]);
   // 同步用户自定义语音表演指南（同上：chatPrompts 拿不到 apiConfig，靠单例读最新值）。
   useEffect(() => {
     setVoicePromptOverrides(apiConfig.voicePrompts);
@@ -3462,10 +3487,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   const dismissError = () => { setErrorDialog(null); };
 
   // --- APPEARANCE PRESETS ---
-  const saveAppearancePreset = async (name: string) => {
+  const saveAppearancePreset = async (name: string, themeOverride?: OSTheme) => {
       // theme.wallpaper 在内存里是 blob: objectURL（会话临时），不能存进预设。
       // 换成 assets 'wallpaper' 里的持久指针（blobref 令牌 / http / 渐变）。
-      const presetTheme: OSTheme = { ...theme };
+      const presetTheme: OSTheme = { ...(themeOverride || theme) };
       if (presetTheme.wallpaper && presetTheme.wallpaper.startsWith('blob:')) {
           presetTheme.wallpaper = (await DB.getAsset('wallpaper')) || '';
       }
@@ -3724,6 +3749,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           const zip = new JSZip();
           const assetsFolder = zip.folder("assets");
           let assetCount = 0;
+          let malformedImageCount = 0;
+          const malformedImageDiagnostics: MalformedBackupImageDiagnostic[] = [];
+          const maxMalformedImageDiagnostics = 100;
 
           // Dedup table — same base64 payload reused across stores (角色头像在
           // 多个 chat / handbook / room 里被嵌入) gets stored exactly once. Key
@@ -3783,19 +3811,33 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           };
 
           // 把一条 data:image base64 落进 ZIP 的 assets/ 文件夹，返回它的 assets/* 路径。
-          // 同一份 base64 全局只存一份（assetDedupMap 按完整 base64 去重）；无法识别的
-          // data url 原样返回，不动它。
-          const resolveImage = (value: string): string => {
+          // 同一份 base64 全局只存一份（assetDedupMap 按完整 base64 去重）。无法识别但
+          // 不一定损坏的 data url 原样保留；确认损坏的正文只在导出副本里置空。
+          const resolveImage = (value: string, location: string): string => {
               try {
                   const cached = assetDedupMap.get(value);
                   if (cached) return cached;
-                  const extMatch = value.match(/data:image\/([a-zA-Z0-9]+);base64,/);
-                  if (!extMatch) return value;
-                  const ext = extMatch[1] === 'jpeg' ? 'jpg' : extMatch[1];
-                  const filename = `asset_${Date.now()}_${assetCount++}.${ext}`;
-                  const base64Data = value.split(',')[1];
+                  const parsed = parseImageDataUrlForBackup(value);
+                  if (!parsed.ok) {
+                      // SVG、带额外 MIME 参数等本来就不走 assets/* 的 data URL 沿用旧行为，
+                      // 原样留在 JSON，也不把它误报成「损坏图片」。
+                      if (parsed.reason === 'unsupported-header') return value;
+                      malformedImageCount++;
+                      if (malformedImageDiagnostics.length < maxMalformedImageDiagnostics) {
+                          malformedImageDiagnostics.push({
+                              location,
+                              reason: parsed.reason,
+                              originalLength: value.length,
+                          });
+                      }
+                      // 坏 Base64 已无法还原；不把正文写进 assets 或备份 JSON，避免恢复后继续
+                      // 传播脏数据。这里只修改 IDB 结构化克隆/运行态深拷贝，不会改用户本地库。
+                      console.warn(`[Backup] 损坏图片已从导出副本跳过: ${location} (${parsed.reason}, ${value.length} chars)`);
+                      return '';
+                  }
+                  const filename = `asset_${Date.now()}_${assetCount++}.${parsed.extension}`;
                   // JPEG/PNG/WebP/GIF 本身已压缩，再跑 DEFLATE 只会浪费手机 CPU；直接存储。
-                  assetsFolder?.file(filename, base64Data, { base64: true, compression: 'STORE' });
+                  assetsFolder?.file(filename, parsed.base64, { base64: true, compression: 'STORE' });
                   const path = `assets/${filename}`;
                   assetDedupMap.set(value, path);
                   return path;
@@ -3809,8 +3851,32 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 原地把 base64 换成 assets/* 路径，不再另建一棵对象树，导出大 store 时峰值内存更省。
           // 传进来的必须是独立副本：store 数据是 IDB 结构化克隆副本（安全）；theme /
           // customIcons / appearancePresets 引用了运行态 state，已在上面 backupData 里深拷贝。
-          const processObject = (obj: any): any => {
-              extractImagesInPlace(obj, resolveImage);
+          const processObject = (obj: any, source = 'backupData'): any => {
+              const safeRecordId = (value: unknown): string | null => {
+                  if (typeof value !== 'string' && typeof value !== 'number') return null;
+                  return String(value).replace(/[\r\n]/g, ' ').slice(0, 80);
+              };
+              const describeLocation = (path: BackupObjectPath): string => {
+                  let label = source;
+                  let pathStart = 0;
+                  if (Array.isArray(obj) && typeof path[0] === 'number') {
+                      const index = path[0];
+                      const row = obj[index];
+                      const id = row && typeof row === 'object'
+                          ? safeRecordId((row as any).id ?? (row as any).uuid ?? (row as any).key)
+                          : null;
+                      label += `[${index}]${id ? `(id=${id})` : ''}`;
+                      pathStart = 1;
+                  } else if (obj && typeof obj === 'object' && !source.includes('(id=')) {
+                      const id = safeRecordId((obj as any).id ?? (obj as any).uuid ?? (obj as any).key);
+                      if (id) label += `(id=${id})`;
+                  }
+                  for (const segment of path.slice(pathStart)) {
+                      label += typeof segment === 'number' ? `[${segment}]` : `.${segment}`;
+                  }
+                  return label;
+              };
+              extractImagesInPlace(obj, (dataUrl, path) => resolveImage(dataUrl, describeLocation(path)));
               return obj;
           };
 
@@ -3882,6 +3948,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               timestamp: Date.now(),
               version: 3,
               apiConfig: (mode === 'text_only' || mode === 'full') ? apiConfig : undefined,
+              checkPhoneApi: (mode === 'text_only' || mode === 'full') ? getCheckPhoneApi() : undefined,
               apiPresets: (mode === 'text_only' || mode === 'full') ? apiPresets : undefined,
               availableModels: (mode === 'text_only' || mode === 'full') ? availableModels : undefined,
               realtimeConfig: (mode === 'text_only' || mode === 'full') ? realtimeConfig : undefined,
@@ -4050,6 +4117,43 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // data URL 才能跨设备），所以在对象字面量外单独 await。text_only 只带配色偏好、跳过看板大图。
           backupData.desktopSkinLocal = await exportDesktopSkinLocal(mode !== 'text_only');
 
+          // 协同工作是可拆卸的独立 IndexedDB，不在主 DB store 清单里，必须单独打包。
+          // text_only 带窗口/消息/分类/API 设置但不带文件字节；media_only 只带文件字节；
+          // full 两者都带。文件原始 Blob 直写 ZIP，避免 base64 放大和重复保存。
+          const { CollaborationStore } = await import('../features/collaboration/store');
+          const includeCollaborationText = mode !== 'media_only';
+          const includeCollaborationAssets = mode !== 'text_only';
+          const collaborationBackup = await CollaborationStore.exportBackup(
+              includeCollaborationAssets,
+              includeCollaborationText,
+          );
+          backupData.collaborationBackupVersion = 1;
+          backupData.collaborationBackupMode = mode;
+          if (includeCollaborationText) {
+              backupData.collaborationSessions = collaborationBackup.sessions || [];
+              backupData.collaborationMessages = collaborationBackup.messages || [];
+              backupData.collaborationCategories = collaborationBackup.categories || [];
+              backupData.collaborationSettings = collaborationBackup.settings;
+          }
+          if (includeCollaborationAssets) {
+              backupData.collaborationAssetIndex = [];
+              const collaborationAssets = collaborationBackup.assets || [];
+              for (let index = 0; index < collaborationAssets.length; index++) {
+                  const asset = collaborationAssets[index];
+                  const safeId = asset.id.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120) || `asset-${index}`;
+                  const path = `collaboration/assets/${String(index).padStart(5, '0')}-${safeId}.bin`;
+                  zip.file(path, new Uint8Array(await asset.blob.arrayBuffer()), { compression: 'STORE' });
+                  backupData.collaborationAssetIndex.push({
+                      id: asset.id,
+                      path,
+                      mimeType: asset.blob.type || 'application/octet-stream',
+                      size: asset.blob.size,
+                      createdAt: asset.createdAt,
+                  });
+                  if (index % 10 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
+              }
+          }
+
           const totalSteps = storesToProcess.length + 3;
           let currentStep = 0;
 
@@ -4074,12 +4178,12 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   }
               }
 
-              if (backupData.socialAppData?.userProfile) processObject(backupData.socialAppData.userProfile);
-              if (backupData.socialAppData?.userBg) processObject(backupData.socialAppData.userBg);
-              if (backupData.roomCustomAssets) processObject(backupData.roomCustomAssets);
-              if (backupData.theme) processObject(backupData.theme);
-              if (backupData.customIcons) processObject(backupData.customIcons);
-              if (backupData.appearancePresets) processObject(backupData.appearancePresets);
+              if (backupData.socialAppData?.userProfile) processObject(backupData.socialAppData.userProfile, 'socialAppData.userProfile');
+              if (backupData.socialAppData?.userBg) processObject(backupData.socialAppData.userBg, 'socialAppData.userBg');
+              if (backupData.roomCustomAssets) processObject(backupData.roomCustomAssets, 'roomCustomAssets');
+              if (backupData.theme) processObject(backupData.theme, 'theme');
+              if (backupData.customIcons) processObject(backupData.customIcons, 'customIcons');
+              if (backupData.appearancePresets) processObject(backupData.appearancePresets, 'appearancePresets');
           } else {
               // Strip images for text only
               if (backupData.socialAppData?.userProfile) backupData.socialAppData.userProfile = stripBase64(backupData.socialAppData.userProfile);
@@ -4120,11 +4224,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           ]);
 
           // Chunked processObject for large arrays — yields to main thread every 200 items
-          const processArrayChunked = async (arr: any[], fn: (item: any) => any, chunkSize = 200): Promise<any[]> => {
+          const processArrayChunked = async (arr: any[], fn: (item: any, index: number) => any, chunkSize = 200): Promise<any[]> => {
               if (arr.length <= chunkSize) return arr.map(fn);
               const result: any[] = [];
               for (let i = 0; i < arr.length; i += chunkSize) {
-                  const chunk = arr.slice(i, i + chunkSize).map(fn);
+                  const chunk = arr.slice(i, i + chunkSize).map((item, offset) => fn(item, i + offset));
                   result.push(...chunk);
                   if (i + chunkSize < arr.length) {
                       await new Promise(r => setTimeout(r, 0));
@@ -4326,7 +4430,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   if (storeName === 'characters' && mode === 'media_only') {
                       // Character Logic: Export ONLY visual assets to mediaAssets array
                       // Do not export the full character array to avoid overwriting text data on import
-                      const mediaList = rawData.map((c: CharacterProfile) => {
+                      const mediaList = rawData.map((c: CharacterProfile, index: number) => {
                           const extracted = {
                               charId: c.id,
                               avatar: c.avatar,
@@ -4354,15 +4458,20 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                                   roomFloor: c.roomConfig?.floorImage
                               }
                           };
-                          return processObject(extracted);
+                          return processObject(extracted, `characters[${index}](id=${String(c.id).slice(0, 80)})`);
                       });
                       backupData.mediaAssets = mediaList;
                       continue; // Skip standard assignment
                   }
 
                   processedData = Array.isArray(rawData) && rawData.length > 200
-                      ? await processArrayChunked(rawData, processObject)
-                      : processObject(rawData);
+                      ? await processArrayChunked(rawData, (item, index) => {
+                          const id = item && typeof item === 'object'
+                              ? String(item.id ?? item.uuid ?? item.key ?? '').replace(/[\r\n]/g, ' ').slice(0, 80)
+                              : '';
+                          return processObject(item, `${storeName}[${index}]${id ? `(id=${id})` : ''}`);
+                      })
+                      : processObject(rawData, storeName);
               }
 
               // Assign to Backup Data
@@ -4488,6 +4597,18 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               }
           }
 
+          if (malformedImageCount > 0) {
+              zip.file(
+                  'diagnostics/malformed-images.json',
+                  JSON.stringify(buildMalformedImageDiagnostics({
+                      createdAt: new Date().toISOString(),
+                      mode,
+                      total: malformedImageCount,
+                      items: malformedImageDiagnostics,
+                  }), null, 2),
+              );
+          }
+
           // 进度提示：每 ~5% 更新一次（避免高频 React 重渲染），同时让进度
           // 条从 70% 平滑爬到 99%，用户能确切看到"在动"。
           let lastReportedPercent = -10;
@@ -4515,6 +4636,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           setSysOperation({ status: 'idle', message: '', progress: 100 });
           // 备份成功 → 推进「该备份啦」提醒的计时（本地导出 / 云备份都走这里，一处覆盖两条路径）
           markBackupDone();
+          if (malformedImageCount > 0) {
+              console.warn(`[Backup] 备份已完成，已从导出副本跳过 ${malformedImageCount} 处损坏图片`, malformedImageDiagnostics);
+              addToast(`备份已生成，已跳过 ${malformedImageCount} 处无法恢复的损坏图片；其他数据已正常保存`, 'info');
+          }
           return content;
 
       } catch (e: any) {
@@ -4645,6 +4770,36 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 必须发生在 restoreAssetsInPlace / DB.importFullData 之前：不受支持的第三方
           // 备份一旦命中特征就整包拒绝，不能出现“导入了一半才报错”的状态。
           assertSupportedSullyBackup(data);
+
+          // 协同文件先完整读出并校验，再开始写任何主数据库。这样文件索引损坏或 ZIP
+          // 缺项时会整包中止，不会出现主数据已恢复、协同文件只回来一半的状态。
+          let collaborationAssetRecords: Array<{ id: string; blob: Blob; createdAt: number }> | undefined;
+          if (data.collaborationAssetIndex !== undefined) {
+              collaborationAssetRecords = [];
+              if (data.collaborationAssetIndex.length > 0 && !zip) {
+                  throw new Error('损坏的备份包：协同文件缺少 ZIP 数据');
+              }
+              for (let index = 0; index < data.collaborationAssetIndex.length; index++) {
+                  const item = data.collaborationAssetIndex[index];
+                  if (!item?.id || !item.path?.startsWith('collaboration/assets/')) {
+                      throw new Error('损坏的备份包：协同文件索引无效');
+                  }
+                  const entry = zip?.file(item.path);
+                  if (!entry) throw new Error(`损坏的备份包：缺少协同文件 ${item.path}`);
+                  const bytes = await entry.async('uint8array');
+                  if (typeof item.size === 'number' && item.size >= 0 && bytes.byteLength !== item.size) {
+                      throw new Error(`损坏的备份包：协同文件大小不符 ${item.path}`);
+                  }
+                  const fileBytes = new Uint8Array(bytes.byteLength);
+                  fileBytes.set(bytes);
+                  collaborationAssetRecords.push({
+                      id: item.id,
+                      blob: new Blob([fileBytes.buffer], { type: item.mimeType || 'application/octet-stream' }),
+                      createdAt: Number(item.createdAt) || Date.now(),
+                  });
+                  if (index % 10 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
+              }
+          }
 
           // v2 backups keep favorite voice bytes outside JSON. Rehydrate every marker
           // before DB.importFullData starts, so a missing/truncated file aborts while
@@ -4787,6 +4942,25 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   });
               },
           });
+
+          const hasCollaborationBackup = data.collaborationSessions !== undefined
+              || data.collaborationMessages !== undefined
+              || data.collaborationCategories !== undefined
+              || data.collaborationSettings !== undefined
+              || collaborationAssetRecords !== undefined;
+          if (hasCollaborationBackup) {
+              showImportProgress('database', '正在恢复协同工作...', 91, { current: '协同窗口与文件', currentFile: '' });
+              const { CollaborationStore } = await import('../features/collaboration/store');
+              await CollaborationStore.importBackup({
+                  sessions: data.collaborationSessions,
+                  messages: data.collaborationMessages,
+                  categories: data.collaborationCategories,
+                  settings: data.collaborationSettings,
+                  assets: collaborationAssetRecords,
+              }, {
+                  replaceAssets: data.collaborationBackupMode === 'full',
+              });
+          }
           
           showImportProgress('settings', '正在恢复系统设置...', 92, { current: '系统设置', currentFile: '' });
           if (data.theme) {
@@ -4794,6 +4968,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               await updateTheme(data.theme);
           }
           if (data.apiConfig) updateApiConfig(data.apiConfig);
+          if (data.checkPhoneApi !== undefined) setCheckPhoneApi(data.checkPhoneApi ?? null);
           if (data.availableModels) saveModels(data.availableModels);
           if (data.apiPresets) savePresets(data.apiPresets);
           if (data.realtimeConfig) updateRealtimeConfig(data.realtimeConfig); // 恢复实时感知配置

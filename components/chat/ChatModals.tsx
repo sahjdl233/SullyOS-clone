@@ -8,6 +8,8 @@ import EmotionSettingsPanel from './EmotionSettingsPanel';
 import { isTranslationLangPreset, normalizeTranslationLangLabel, TRANSLATION_LANG_MAX_LENGTH, TRANSLATION_LANG_PRESETS } from '../../utils/translationLang';
 import type { ContextRangeMode, ContextRangeSnapshot } from '../../utils/chatContextRange';
 import { trackEvent } from '../../utils/analytics';
+import { CANTONESE_VOICE_SUPPORT_NOTE, VOICE_LANGUAGE_OPTIONS } from '../../utils/voiceLanguage';
+import { chatMessageFuzzyMatchesKeyword } from '../../utils/chatMessageSearch';
 
 interface ChatModalsProps {
     modalType: string;
@@ -28,8 +30,6 @@ interface ChatModalsProps {
     contextSuiteAnyEnabled: boolean;
     contextSuiteAllEnabled: boolean;
     onToggleContextSuite: () => void;
-    preserveContext: boolean;
-    setPreserveContext: (v: boolean) => void;
     editContent: string;
     setEditContent: (v: string) => void;
     
@@ -67,7 +67,7 @@ interface ChatModalsProps {
     onSaveSettings: () => void;
     onBgUpload: (file: File) => void;
     onRemoveBg: () => void;
-    onClearHistory: () => void;
+    onOpenHistoryCleanup?: () => void;
     onArchive: () => void;
     onCreatePrompt: () => void;
     onEditPrompt: () => void;
@@ -82,6 +82,8 @@ interface ChatModalsProps {
     onConfirmEditMessage: () => void;
     onDeleteMessage: () => void;
     onCopyMessage: () => void;
+    onToggleMessageFavorite?: () => void;
+    messageFavorited?: boolean;
     onDeleteEmoji: () => void;
     onDeleteCategory: () => void;
     // Category Visibility
@@ -241,7 +243,6 @@ const ChatModals: React.FC<ChatModalsProps> = ({
     settingsContextRangeMode, setSettingsContextRangeMode,
     settingsHideSysLogs, setSettingsHideSysLogs,
     contextSuiteAnyEnabled, contextSuiteAllEnabled, onToggleContextSuite,
-    preserveContext, setPreserveContext,
     editContent, setEditContent,
     newCategoryName, setNewCategoryName, onAddCategory,
     newEmojiName, setNewEmojiName, onRenameEmoji,
@@ -251,9 +252,9 @@ const ChatModals: React.FC<ChatModalsProps> = ({
     allHistoryMessages = [],
     contextRangeSnapshot,
     onTransfer, onImportEmoji, onSaveSettings,
-    onBgUpload, onRemoveBg, onClearHistory,
+    onBgUpload, onRemoveBg, onOpenHistoryCleanup,
     onArchive, onCreatePrompt, onEditPrompt, onSavePrompt, onDeletePrompt,
-    onSetHistoryStart, onRestoreAdaptiveContext, onJumpToMessageInChat, onEnterSelectionMode, onReplyMessage, onEditMessageStart, onConfirmEditMessage, onDeleteMessage, onCopyMessage, onDeleteEmoji, onDeleteCategory,
+    onSetHistoryStart, onRestoreAdaptiveContext, onJumpToMessageInChat, onEnterSelectionMode, onReplyMessage, onEditMessageStart, onConfirmEditMessage, onDeleteMessage, onCopyMessage, onToggleMessageFavorite, messageFavorited, onDeleteEmoji, onDeleteCategory,
     allCharacters = [], onSaveCategoryVisibility,
     translationEnabled, onToggleTranslation, translationExpanded, onToggleTranslationExpanded, translateSourceLang, translateTargetLang, onSetTranslateSourceLang, onSetTranslateLang,
     xhsEnabled, onToggleXhs,
@@ -303,22 +304,6 @@ const ChatModals: React.FC<ChatModalsProps> = ({
         }
         // 范围内直接设置；范围外由上层直接提示先调整拉杆。
         onSetHistoryStart(msgId);
-    };
-
-    // 模糊匹配：query 的所有字符按顺序在 content 里出现即算命中（大小写不敏感）。
-    // 中文按字符级 subsequence 匹配，英文同理。
-    const fuzzyMatch = (content: string, query: string): boolean => {
-        if (!query) return true;
-        const c = content.toLowerCase();
-        const q = query.toLowerCase();
-        if (c.includes(q)) return true;
-        let idx = 0;
-        for (const ch of q) {
-            const found = c.indexOf(ch, idx);
-            if (found < 0) return false;
-            idx = found + 1;
-        }
-        return true;
     };
 
     // 高亮命中的连续子串（优先），否则不高亮（subsequence 命中时高亮意义不大）。
@@ -636,13 +621,14 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                              <div className="mt-3">
                                  <label className="text-[10px] font-bold text-slate-400 mb-1.5 block">语音语种</label>
                                  <div className="flex flex-wrap gap-1.5">
-                                     {[{v:'',l:'默认'},{v:'en',l:'English'},{v:'ja',l:'日本語'},{v:'ko',l:'한국어'},{v:'fr',l:'Français'},{v:'es',l:'Español'}].map(opt => (
-                                         <button key={opt.v} onClick={() => onSetChatVoiceLang?.(opt.v)}
-                                             className={`px-2.5 py-1 rounded-full text-[11px] font-bold transition-all ${chatVoiceLang === opt.v ? 'bg-emerald-500 text-white' : 'bg-slate-100 text-slate-500'}`}>
-                                             {opt.l}
+                                     {VOICE_LANGUAGE_OPTIONS.map(opt => (
+                                         <button key={opt.value} onClick={() => onSetChatVoiceLang?.(opt.value)}
+                                             className={`px-2.5 py-1 rounded-full text-[11px] font-bold transition-all ${chatVoiceLang === opt.value ? 'bg-emerald-500 text-white' : 'bg-slate-100 text-slate-500'}`}>
+                                             {opt.label}
                                          </button>
                                      ))}
                                  </div>
+                                 {chatVoiceLang === 'yue' && <p className="text-[10px] text-amber-600/80 mt-1.5">{CANTONESE_VOICE_SUPPORT_NOTE}</p>}
                                  {chatVoiceLang && <p className="text-[10px] text-emerald-600/70 mt-1.5">选择非默认语种时，AI 台词会先翻译再生成语音。</p>}
                              </div>
                          )}
@@ -694,15 +680,10 @@ const ChatModals: React.FC<ChatModalsProps> = ({
 
                      <div className="pt-2 border-t border-slate-100">
                          <label className="text-xs font-bold text-red-400 uppercase mb-3 block">危险区域 (Danger Zone)</label>
-                         <div className="flex items-center gap-2 mb-3 cursor-pointer" onClick={() => setPreserveContext(!preserveContext)}>
-                             <div className={`w-5 h-5 rounded-full border flex items-center justify-center transition-colors ${preserveContext ? 'bg-primary border-primary' : 'bg-slate-100 border-slate-300'}`}>
-                                 {preserveContext && <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>}
-                             </div>
-                             <span className="text-sm text-slate-600">清空时保留最后10条记录 (维持语境)</span>
-                         </div>
-                         <button onClick={onClearHistory} className="w-full py-3 bg-red-50 text-red-500 font-bold rounded-2xl border border-red-100 active:scale-95 transition-transform flex items-center justify-center gap-2">
-                             执行清空
-                         </button>
+                         {onOpenHistoryCleanup && <div className="mb-4">
+                             <button type="button" onClick={onOpenHistoryCleanup} className="w-full rounded-2xl border border-red-100 bg-red-50 py-3 text-sm font-bold text-red-600">清理指定范围 / 保留最近 N 条</button>
+                             <p className="mt-2 text-center text-[10px] text-slate-400">按页选择记录，永久删除前需要两次确认。</p>
+                         </div>}
                      </div>
                 </div>
             </Modal>
@@ -891,7 +872,7 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                     {(() => {
                         const reversed = allHistoryMessages.slice().reverse();
                         const query = historySearch.trim();
-                        const filtered = query ? reversed.filter(m => fuzzyMatch(m.content || '', query)) : reversed;
+                        const filtered = query ? reversed.filter(message => chatMessageFuzzyMatchesKeyword(message, query)) : reversed;
                         const limited = query ? filtered.slice(0, HISTORY_SEARCH_MAX) : filtered;
                         const totalPages = Math.max(1, Math.ceil(limited.length / HISTORY_PAGE_SIZE));
                         const pageMessages = limited.slice(historyPage * HISTORY_PAGE_SIZE, (historyPage + 1) * HISTORY_PAGE_SIZE);
@@ -988,6 +969,14 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                     {selectedMessage?.type === 'text' && (
                         <button onClick={onCopyMessage} className="w-full py-3 bg-slate-50 text-slate-700 font-medium rounded-2xl active:bg-slate-100 transition-colors flex items-center justify-center gap-2">
                             复制文字
+                        </button>
+                    )}
+                    {selectedMessage && onToggleMessageFavorite && (
+                        <button onClick={() => { onToggleMessageFavorite(); setModalType('none'); }} className={`w-full py-3 font-medium rounded-2xl transition-colors flex items-center justify-center gap-2 ${messageFavorited ? 'bg-violet-100 text-violet-700 active:bg-violet-200' : 'bg-violet-50 text-violet-600 active:bg-violet-100'}`}>
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill={messageFavorited ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth={1.5} className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="m11.48 3.499-2.13 4.316-4.763.692c-.963.14-1.348 1.323-.651 2.002l3.447 3.36-.814 4.744c-.165.96.842 1.691 1.703 1.238L12.532 17.6l4.26 2.24c.862.453 1.869-.278 1.704-1.238l-.814-4.744 3.447-3.36c.697-.679.312-1.862-.651-2.002l-4.763-.692-2.13-4.316c-.43-.873-1.675-.873-2.105.011Z" /></svg>
+                            {messageFavorited
+                                ? (selectedMessage.type === 'image' ? '取消收藏图片' : '取消收藏聊天消息')
+                                : (selectedMessage.type === 'image' ? '收藏图片' : '收藏聊天消息')}
                         </button>
                     )}
                     {voiceAvailable && selectedMessage?.role === 'assistant' && selectedMessage?.type === 'text' && onGenerateVoice && (

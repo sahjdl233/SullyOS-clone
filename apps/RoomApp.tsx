@@ -1,3 +1,4 @@
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 import React, { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { useOS } from '../context/OSContext';
@@ -25,6 +26,7 @@ import { resolveCharTimeZone, nowInTimeZone, tzLabel } from '../utils/timezone';
 import { getDailyScheduleForChar } from '../utils/dailySchedule';
 import { trackEvent } from '../utils/analytics';
 import { normalizeBuiltInRoomTemplateAssetsInPlace, toPortableBuiltinRoomAsset } from '../utils/roomTemplateAssets';
+import { shareOrDownloadFile } from '../utils/shareExport';
 
 const TWEMOJI_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72';
 const twemojiUrl = (codepoint: string) => `${TWEMOJI_BASE}/${codepoint}.png`;
@@ -722,9 +724,9 @@ const RoomApp: React.FC = () => {
                 setTodaysTodo(existingTodo);
             }
 
-            const recentMsgs = await DB.getMessagesByCharId(c.id);
+            const recentMsgs = await loadCharacterContextMessages(c);
             // Increased context from 20 to 50
-            const chatContext = recentMsgs.slice(-50).map(m => {
+            const chatContext = recentMsgs.map(m => {
                 const role = m.role === 'user' ? '用户' : c.name;
                 return `${role}: ${m.content.substring(0, 50)}`; 
             }).join('\n');
@@ -1274,16 +1276,13 @@ ${!shouldGenerateTodo ? `(系统: 今日待办已存在，无需生成，请忽�
                 await navigator.clipboard.writeText(json);
                 addToast('小屋 JSON 已复制到剪贴板', 'success');
             } else {
-                const blob = new Blob([json], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `${template.name.replace(/[\\/:*?"<>|]/g, '_')}.room.json`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                addToast('小屋样板房已导出', 'success');
+                const result = await shareOrDownloadFile({
+                    content: json,
+                    fileName: `${template.name.replace(/[\\/:*?"<>|]/g, '_')}.room.json`,
+                    mimeType: 'application/json;charset=utf-8',
+                    shareTitle: `小屋样板房：${template.name}`,
+                });
+                addToast(result === 'shared' ? '已打开小屋样板房分享面板' : '小屋样板房已导出', 'success');
             }
             trackEvent('导出小屋样板房', { action });
         } catch (e: any) {
