@@ -474,7 +474,7 @@ const McpServersCard: React.FC<{
 const Settings: React.FC = () => {
   const {
       apiConfig, updateApiConfig, closeApp, availableModels, setAvailableModels,
-      theme, updateTheme,
+      theme, updateTheme, resetAppearance,
       exportSystem, importSystem, addToast, showError, resetSystem, updateCharacter,
       apiPresets, addApiPreset, updateApiPreset, removeApiPreset,
       sysOperation, // Get progress state
@@ -576,6 +576,24 @@ const Settings: React.FC = () => {
     && ((theme.journalAppearance.preset || 'original') !== 'original'
       || theme.journalAppearance.customCss?.trim())
   );
+
+  const [confirmAppearanceReset, setConfirmAppearanceReset] = useState(false);
+  const [resettingAppearance, setResettingAppearance] = useState(false);
+  const handleAppearanceEmergencyReset = async () => {
+    setResettingAppearance(true);
+    try { await resetAppearance(); }
+    finally { setResettingAppearance(false); setConfirmAppearanceReset(false); }
+  };
+  // 一键还原全部「聊天白框自定义 CSS」：清掉全局 + 每个角色自带的。
+  // 兼作救援：单角色的坏 CSS 把聊天界面整崩、进不去该角色设置时，从这里一键全清即可恢复。
+  const resetAllChromeCss = () => {
+    let n = 0;
+    if (theme.chatChromeCustomCss) { updateTheme({ chatChromeCustomCss: '' }); n++; }
+    (characters || []).forEach((c: any) => {
+      if (c?.chromeCustomCss) { updateCharacter(c.id, { chromeCustomCss: '' } as any); n++; }
+    });
+    addToast(n ? `已还原 ${n} 处聊天白框美化` : '没有需要还原的白框美化', n ? 'success' : 'info');
+  };
 
   const handleJournalAppearanceEmergencyReset = async () => {
     await updateTheme({ journalAppearance: undefined });
@@ -1970,7 +1988,7 @@ const Settings: React.FC = () => {
 
       <div className="flex-1 overflow-y-auto p-5 space-y-6 no-scrollbar pb-20">
 
-        {/* 美化入口本身被错误 CSS 盖住时，必须有一个完全不经过日记 App 的急救通道。 */}
+        {/* 外观救急入口统一放在设置顶部，无需进入已被错误 CSS 遮住的聊天或日记。 */}
         <SettingsSection
             title="外观急救"
             badge={hasJournalAppearanceOverride
@@ -1993,6 +2011,42 @@ const Settings: React.FC = () => {
             >
                 {hasJournalAppearanceOverride ? '重置交换日记美化' : '交换日记当前为原版'}
             </button>
+            <div className="mt-4 border-t border-slate-100 pt-4">
+                <p className="text-xs text-slate-500 leading-relaxed">聊天白框 CSS 导致界面异常、无法进入角色设置时，还原全局及全部角色的白框美化，其他聊天外观设置不受影响。</p>
+                <button type="button"
+                    onClick={() => { if (window.confirm('确定还原全部聊天白框美化？将清空「全局」以及「每个角色」的自定义 CSS（其它聊天外观设置不受影响）。')) resetAllChromeCss(); }}
+                    className="mt-3 w-full rounded-xl bg-amber-600 px-4 py-3 text-xs font-bold text-white shadow-sm transition active:scale-[.98]">
+                    一键还原全部聊天白框美化（救援）
+                </button>
+            </div>
+            <div className="mt-4 border-t border-slate-100 pt-4">
+                <div className="flex items-center gap-2 mb-2">
+                    <h2 className="text-sm font-bold text-rose-500 uppercase tracking-widest">一键还原外观</h2>
+                </div>
+                <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">
+                    把主题色、壁纸、字体、应用图标、桌面小组件、装饰贴纸全部还原成最初始状态。在不同版本之间反复导入预设导致图标错乱时使用。<br/>
+                    <span className="text-slate-400">已保存的外观预设不会被删除，随时还能切回去。</span>
+                </p>
+                {!confirmAppearanceReset ? (
+                    <button onClick={() => setConfirmAppearanceReset(true)}
+                        className="w-full py-2.5 bg-white text-rose-500 font-bold text-xs rounded-xl border border-rose-200 active:scale-95 transition-transform flex items-center justify-center gap-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" /></svg>
+                        还原为初始外观
+                    </button>
+                ) : (
+                    <div className="flex gap-2">
+                        <button onClick={handleAppearanceEmergencyReset} disabled={resettingAppearance}
+                            className="flex-1 py-2.5 bg-rose-500 text-white font-bold text-xs rounded-xl shadow-sm active:scale-95 transition-transform disabled:opacity-50">
+                            {resettingAppearance ? '正在还原...' : '确认还原'}
+                        </button>
+                        <button onClick={() => setConfirmAppearanceReset(false)} disabled={resettingAppearance}
+                            className="flex-1 py-2.5 bg-white text-slate-500 font-bold text-xs rounded-xl border border-slate-200 active:scale-95 transition-transform disabled:opacity-50">
+                            取消
+                        </button>
+                    </div>
+                )}
+            </div>
+
         </SettingsSection>
         
         {/* 数据备份区域 */}
@@ -3485,7 +3539,7 @@ const Settings: React.FC = () => {
                     不碰你和角色的任何对话、记忆、设定，不碰你输入的任何文字，不碰 API 和 MCP 配置。
                 </p>
                 <p className="text-xs text-slate-500 leading-relaxed">
-                    SullyOS 的功能已经多到我们自己也扫不完，但「哪些真的有人用、大家配置时卡在哪一步」
+                    SullyOS·糯米机 的功能已经多到我们自己也扫不完，但「哪些真的有人用、大家配置时卡在哪一步」
                     基本靠猜。留着这个开关开着能帮我们看清这些，好把精力放在有人用的地方。
                     不想参与就关掉，功能一点不受影响。
                 </p>
@@ -4553,7 +4607,7 @@ const Settings: React.FC = () => {
               <div className="bg-sky-50/60 rounded-xl p-3 space-y-1.5">
                   <p className="font-bold text-sky-700">🏠 为什么服务器要自己准备？</p>
                   <p>
-                      SullyOS 的核心前端可以静态部署，也没有强制所有 MCP 流量经过项目方的中央代理。
+                      SullyOS·糯米机 的核心前端可以静态部署，也没有强制所有 MCP 流量经过项目方的中央代理。
                       URL 和凭据默认留在本机，工具服务器需要你自己准备，三选一：
                   </p>
                   <p>
@@ -4582,7 +4636,7 @@ const Settings: React.FC = () => {
                   <button
                       type="button"
                       onClick={async () => {
-                          const text = `请阅读这份教程，然后一步一步教我把 MCP 工具服务器接入 SullyOS。先问清楚我想接什么工具、准备部署在哪（云端/本地电脑/本地+内网穿透），再给对应路线的步骤：\n${MCP_USER_GUIDE_URL}`;
+                          const text = `请阅读这份教程，然后一步一步教我把 MCP 工具服务器接入 SullyOS·糯米机。先问清楚我想接什么工具、准备部署在哪（云端/本地电脑/本地+内网穿透），再给对应路线的步骤：\n${MCP_USER_GUIDE_URL}`;
                           try { await navigator.clipboard.writeText(text); trackEvent('复制 MCP 部署指引给 AI', { result: 'copied' }); addToast('已复制，去粘贴给你的 AI 吧', 'success'); }
                           catch { trackEvent('复制 MCP 部署指引给 AI', { result: 'clipboard-failed' }); addToast('复制失败，请手动复制教程链接', 'error'); }
                       }}

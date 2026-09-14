@@ -9,7 +9,7 @@ import { readShareText } from '../../utils/pngShare';
 const PRESET_STORE_KEY = 'sully_chrome_css_presets_v1';
 
 // 丢给别的 AI 的提示词（让它按想要的风格生成整段 CSS）。
-const AI_PROMPT = `你是一个 CSS 设计师。我在用一个叫 SullyOS 的「浏览器里的虚拟手机」聊天 App，
+const AI_PROMPT = `你是一个 CSS 设计师。我在用一个叫 SullyOS·糯米机 的「浏览器里的虚拟手机」聊天 App，
 它允许我用一段自定义 CSS 来重新设计聊天外壳与消息布局。
 这段 CSS 会被注入到聊天界面里，通过下面这些固定类名生效。请帮我写一整段 CSS，
 实现我想要的风格——你有很高的自由度，不要只改颜色，可以大胆重构整个顶栏的视觉。
@@ -25,6 +25,11 @@ const AI_PROMPT = `你是一个 CSS 设计师。我在用一个叫 SullyOS 的�
 - .sully-chat-token     右上角 token 用量小标签
 - .sully-chat-trigger   右侧「触发 AI」的小闪电按钮
 - .sully-chat-inputbar  底部输入栏整块
+- .sully-chat-composer 输入栏内的输入行（建议用此类名，不依赖子元素序号）
+- .sully-chat-input-wrap / .sully-chat-textarea 输入框外壳 / 文本输入框
+- .sully-chat-actions-button / .sully-chat-send-button 功能按钮 / 发送按钮
+- .sully-chat-emoji-suggestions 表情联想区（输入栏外的独立同级区域）
+- .sully-chat-auto-reply 自动回复倒计时（输入栏外的独立同级区域）
 - .sully-chat-panel     点「＋」拉起的功能面板（表情/动作菜单），其中按钮是 .sully-chat-panel button
 - .sully-chat-message   普通消息整行；同时带 -ai / -user 和 -group-first / -group-last 状态类
 - .sully-chat-message-content 该条消息的气泡列
@@ -304,7 +309,7 @@ const ChromeCssEditor: React.FC<{ value: string; onChange: (css: string) => void
     };
     const handleSavePreset = () => {
         if (!value.trim() || typeof window === 'undefined') return;
-        const name = window.prompt('给这套白框预设起个名字（所有角色通用）：', '我的预设')?.trim();
+        const name = window.prompt('给这套装扮 CSS 预设起个名字（所有角色通用）：', '我的预设')?.trim();
         if (!name) return;
         commitCustom([...custom.filter((p) => p.name !== name), { name, code: value }]);
     };
@@ -341,7 +346,7 @@ const ChromeCssEditor: React.FC<{ value: string; onChange: (css: string) => void
                 content: value,
                 fileName,
                 mimeType: 'text/plain;charset=utf-8',
-                shareTitle: 'SullyOS 白框样式',
+                shareTitle: 'SullyOS·糯米机 白框样式',
             });
         } catch (error: any) {
             if (error?.name !== 'AbortError') window.alert('TXT 导出失败，请重试。');

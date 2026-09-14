@@ -114,6 +114,8 @@ export interface OSTheme {
   contentColor?: string;
   /** 冷启动时是否播放整机开机过场。默认开启（undefined 视为 true）。 */
   bootAnimationEnabled?: boolean;
+  /** 整机开场风格；未设置时使用水母。关闭动画时仍保留选择。 */
+  bootAnimationStyle?: 'classic' | 'jellyfish';
   /** 进入聊天或切换角色时是否播放角色登场过场。默认开启。 */
   chatCharacterSwitchAnimationEnabled?: boolean;
   /** App 代码块加载较慢时是否显示加载柔光动画。默认开启；超时恢复页不受影响。 */
@@ -180,6 +182,8 @@ export interface OSTheme {
   chatHeaderStyle?: 'default' | 'minimal' | 'gradient' | 'wechat' | 'telegram' | 'discord' | 'pixel';
   chatInputStyle?: 'default' | 'rounded' | 'flat' | 'wechat' | 'ios' | 'telegram' | 'discord' | 'pixel';
   chatChromeStyle?: 'soft' | 'flat' | 'floating' | 'pixel';
+  chatDefaultBubbleStyle?: string;
+  chatBackground?: string;
   chatBackgroundStyle?: 'plain' | 'grid' | 'paper' | 'mesh';
   chatHeaderAlign?: 'left' | 'center';
   chatHeaderDensity?: 'compact' | 'default' | 'airy';
@@ -1215,12 +1219,15 @@ export interface NovelBook {
 
 /** 虚拟世界里的房间。 */
 export type VRRoomId = 'library' | 'music' | 'guestbook' | 'gym' | 'postoffice' | 'theater' | 'signal' | 'sar' | 'cafe';
+export type VRSARActivity = 'cabinet' | 'module-shop' | 'fishing' | 'market' | 'garden';
 
 /** 全局小说库里的一本书（所有角色共享原文，各自留批注、各自书签）。 */
 export interface VRWorldNovel {
     id: string;
     title: string;
     author?: string;
+    /** 书库分类的稳定 ID；旧书缺省为未分类。 */
+    categoryId?: string;
     /** 简介，喂给角色当背景，也用于 UI 展示 */
     summary?: string;
     /** 原文按阅读单元切好的段落块（每块 ~数百字，便于定位批注与推进书签）。 */
@@ -1230,6 +1237,8 @@ export interface VRWorldNovel {
     createdAt: number;
     updatedAt: number;
 }
+
+export interface VRLibraryCategory { id: string; name: string; }
 
 /** 小说里的一个阅读单元（原文段落块）。 */
 export interface VRNovelSegment {
@@ -1306,6 +1315,12 @@ export interface VRWorldCharState {
     novelBookmarks?: Record<string, number>;
     /** 用户为该角色圈定的优先书单。为空时从全书库自动轮换。 */
     preferredNovelIds?: string[];
+    /** categories 模式只在所选分类中阅读，不回退到其他分类。缺省兼容旧的逐本优先规则。 */
+    novelReadingMode?: 'all' | 'books' | 'categories';
+    preferredNovelCategoryIds?: string[];
+    /** 仅限制自动自由活动，手动邀请可绕过；空或缺省为不限制。 */
+    excludedAutoRooms?: VRRoomId[];
+    excludedAutoSARActivities?: VRSARActivity[];
     /** 上一次图书馆活动选中的小说，用于有其它候选时避免连续读同一本。 */
     lastNovelId?: string;
     /** 最近一次活动落在哪个房间（UI 立绘站位用） */
@@ -1315,7 +1330,7 @@ export interface VRWorldCharState {
     /** SAR 临时模块。真实人格不改，只改变前台对话的外显层。 */
     sarModule?: SARModuleRuntimeState;
     /** 最近一次 SAR 自由活动，供活动室和模块触发判断展示。 */
-    sarActivity?: 'cabinet' | 'module-shop' | 'fishing' | 'market' | 'garden';
+    sarActivity?: VRSARActivity;
     /** 该角色专属 API 覆盖（用户可单独为「彼方」活动配 api）；不设则回落全局 apiConfig。 */
     api?: { baseUrl: string; apiKey: string; model: string };
     /**
@@ -2894,6 +2909,9 @@ export interface CharacterProfile {
    *  enabled 为 false/undefined 或整个字段缺省 = 完全跟随全局（现状零变化）。
    *  属美化类本地偏好：随完整备份走，但角色卡分享时剥离（见 utils/characterCard.ts）。 */
   chatFineTune?: ChatFineTuneOverride;
+  /** ChatApp visual fields only; filtered through the decoration allowlist. */
+  chatAppearance?: Partial<OSTheme>;
+  chatDecorationCssIsolated?: boolean;
   chatBackground?: string;
   contextLimit?: number;
   /**

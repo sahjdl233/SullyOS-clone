@@ -1,3 +1,4 @@
+import { toMountedWorldbook } from './worldbook';
 
 
 
@@ -8,7 +9,7 @@ import {
     BankTransaction, SavingsGoal, BankFullState, DollhouseState, XhsStockImage, XhsActivityRecord, XhsOwnedPost, SongSheet, QuizSession, GuidebookSession,
     LifeSimState, HandbookEntry, Tracker, TrackerEntry, HotNewsSnapshot,
     LifeRecord, MedPlan, LifeRecordSettings, CharacterGroup,
-    VRWorldNovel, VRNovelAnnotation, CustomCreatorPart, VRMusicRoomState, VRGuestbookState, VRScript, VRStagedPlay, VRLetter,
+    VRWorldNovel, VRLibraryCategory, VRNovelAnnotation, CustomCreatorPart, VRMusicRoomState, VRGuestbookState, VRScript, VRStagedPlay, VRLetter,
     WorldProfile, WorldEpisode, StoryTheaterEntry, StoryTheaterPreset, StoryTheaterMask
 } from '../types';
 import { exportPostOfficeLocal, importPostOfficeLocal } from './vrWorld/postOffice';
@@ -19,6 +20,7 @@ import { exportMcpLocal, importMcpLocal } from './mcpClient';
 import { exportAmsg2GlobalConfig, importAmsg2GlobalConfig } from './activeMsgStore';
 import { exportWorldHomeLocal, importWorldHomeLocal } from './worldHome/localBackup';
 import { exportDesktopSkinLocal, importDesktopSkinLocal } from './desktopSkinBackup';
+import { editLibrary, VR_LIBRARY_RECORD, type LibraryEdit } from './vrWorld/library';
 
 const DB_NAME = 'AetherOS_Data';
 // v67：两条并行线各自用掉了 v65/v66（A线: blob_assets + 生活记录；B线: room_plates 门牌 + digest_reports 消化日志），
@@ -2293,6 +2295,48 @@ export const DB = {
       transaction.objectStore(STORE_WORLDBOOKS).delete(id);
   },
 
+  // Read current records and update the library + mounted caches atomically.
+  // Never loop updateWorldbook with a captured React character snapshot.
+  mutateWorldbooks: async (ids: string[], updates: Partial<Worldbook> | null): Promise<{ books: Worldbook[]; characters: CharacterProfile[] }> => {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+          const tx = db.transaction([STORE_WORLDBOOKS, STORE_CHARACTERS], 'readwrite');
+          const library = tx.objectStore(STORE_WORLDBOOKS);
+          const charactersStore = tx.objectStore(STORE_CHARACTERS);
+          const targets = new Set(ids);
+          const books: Worldbook[] = [];
+          const changedCharacters: CharacterProfile[] = [];
+          const request = library.getAll();
+          request.onsuccess = () => {
+              for (const book of request.result as Worldbook[]) {
+                  if (!targets.has(book.id)) continue;
+                  if (updates === null) library.delete(book.id);
+                  else {
+                      const next = { ...book, ...updates, id: book.id, createdAt: book.createdAt, updatedAt: Date.now() };
+                      books.push(next);
+                      library.put(next);
+                  }
+              }
+              const replacements = new Map(books.map(book => [book.id, toMountedWorldbook(book)]));
+              const chars = charactersStore.getAll();
+              chars.onsuccess = () => {
+                  for (const char of chars.result as CharacterProfile[]) {
+                      const mounted = char.mountedWorldbooks || [];
+                      if (!mounted.some(book => updates === null ? targets.has(book.id) : replacements.has(book.id))) continue;
+                      const next = { ...char, mountedWorldbooks: updates === null
+                          ? mounted.filter(book => !targets.has(book.id))
+                          : mounted.map(book => replacements.get(book.id) || book) };
+                      changedCharacters.push(next);
+                      charactersStore.put(next);
+                  }
+              };
+          };
+          tx.oncomplete = () => resolve({ books, characters: changedCharacters });
+          tx.onerror = () => reject(tx.error || new Error('世界书保存失败'));
+          tx.onabort = () => reject(tx.error || new Error('世界书保存已撤销'));
+      });
+  },
+
   // --- 见面 · 剧情剧场 ---
   getStoryTheaters: async (): Promise<StoryTheaterEntry[]> => {
       const db = await openDB();
@@ -2405,6 +2449,38 @@ export const DB = {
   },
 
   // --- VR World 「彼方」 全局小说库 ---
+  getVRLibraryCategories: async (): Promise<VRLibraryCategory[]> => {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+          const req = db.transaction(STORE_VR_SETTINGS, 'readonly').objectStore(STORE_VR_SETTINGS).get(VR_LIBRARY_RECORD);
+          req.onsuccess = () => resolve(req.result?.categories || []);
+          req.onerror = () => reject(req.error);
+      });
+  },
+
+  editVRLibrary: async (edit: LibraryEdit): Promise<void> => {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+          const tx = db.transaction([STORE_VR_SETTINGS, STORE_VR_NOVELS], 'readwrite');
+          const settings = tx.objectStore(STORE_VR_SETTINGS), books = tx.objectStore(STORE_VR_NOVELS);
+          const categoryRequest = settings.get(VR_LIBRARY_RECORD), novelRequest = books.getAll();
+          let ready = 0;
+          let failure: unknown;
+          const apply = () => {
+              if (++ready !== 2) return;
+              try {
+                  const result = editLibrary(categoryRequest.result?.categories || [], novelRequest.result || [], edit);
+                  settings.put({ id: VR_LIBRARY_RECORD, categories: result.categories });
+                  for (const novel of result.changed) books.put(novel);
+              } catch (error) { failure = error; tx.abort(); }
+          };
+          categoryRequest.onsuccess = apply;
+          novelRequest.onsuccess = apply;
+          tx.oncomplete = () => resolve();
+          tx.onerror = tx.onabort = () => reject(failure || tx.error || new Error('书库分类保存失败'));
+      });
+  },
+
   getVRNovels: async (): Promise<VRWorldNovel[]> => {
       const db = await openDB();
       if (!db.objectStoreNames.contains(STORE_VR_NOVELS)) return [];
@@ -2418,8 +2494,12 @@ export const DB = {
 
   saveVRNovel: async (novel: VRWorldNovel): Promise<void> => {
       const db = await openDB();
-      const transaction = db.transaction(STORE_VR_NOVELS, 'readwrite');
-      transaction.objectStore(STORE_VR_NOVELS).put(novel);
+      return new Promise((resolve, reject) => {
+          const transaction = db.transaction(STORE_VR_NOVELS, 'readwrite');
+          transaction.objectStore(STORE_VR_NOVELS).put(novel);
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = transaction.onabort = () => reject(transaction.error || new Error('书籍保存失败'));
+      });
   },
 
   deleteVRNovel: async (id: string): Promise<void> => {
