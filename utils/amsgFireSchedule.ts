@@ -31,7 +31,7 @@ export const AMSG_FIRE_RENEW_TOOL = 'renew_active_message';
 export const MAX_FIRE_SCHEDULES = 2;
 
 /**
- * 防穿帮策略的说明，前台工具和 fire 侧共用这一份。
+ * 到点策略的说明，前台工具和 fire 侧共用这一份。
  *
  * 分界线不是「谁提的」，是「到点要说的是一件具体的事，还是只是想找话说」：
  * 想找话说的，用户人回来了就该让路；许过的具体承诺（不管是用户要求的还是角色自己说的），
@@ -39,10 +39,10 @@ export const MAX_FIRE_SCHEDULES = 2;
  * 许下的承诺挡在外面了——「汤炖上了两小时后叫你」会被判成该让路，然后再没人提起。
  */
 export const EXPIRE_POLICY_DESCRIPTION = [
-  '防穿帮策略。',
-  'expire（默认，大多数情况用它）：到点时如果排程之后对话已有新进展、或用户此刻正在聊天，这条自动作废——之后你会在排程现状里看到，由你决定自然带出、续期还是放弃。',
+  '到点策略。',
+  'expire（默认，大多数情况用它）：到点时你会先看一眼最新的对话再开口——这件事已经聊过了、或者插进来会打断正在说的事，这次就不发；没发的之后你会在排程现状里看到，由你决定自然带出、续期还是放弃。',
   '挑话题、想找人聊天这类「想说点什么」的排程一律用它：用户人都回来了，你还照着几小时前的想法开口，会很假。',
-  'force：不管用户在不在聊天都照发。用在「到那个点必须说这件具体的事」上，两种来源都算——用户明确要求的（如"8点叫我起床"），以及你自己许下的（如"汤炖上了，两小时后好了叫你""你那个会我到点提醒你"）。',
+  'force：准点照发，不等也不让。用在「到那个点必须说这件具体的事」上，两种来源都算——用户明确要求的（如"8点叫我起床"），以及你自己许下的（如"汤炖上了，两小时后好了叫你""你那个会我到点提醒你"）。',
   '这类兑现的是一个具体承诺，用户中途回来聊过天也不影响它该响。',
 ].join('\n');
 
@@ -67,43 +67,73 @@ export interface FireScheduleTimeOpts {
   tz: AmsgTzRef;
 }
 
-const buildParameters = (example: string) => ({
+/**
+ * 用户放没放开的两项能力（见 amsgLimits）。没放开的参数干脆不出现在工具签名里：
+ * 摆在那儿等于邀请模型去选，选了再被打回白费一轮。代码那头照样拦（checkSelfScheduleRules）。
+ */
+export interface SelfScheduleAbilities {
+  allowRecurring: boolean;
+  allowForce: boolean;
+}
+
+/** 前台工具桥和 fire 侧共用的参数表（描述里的示例与说法两边各给）。 */
+export const buildScheduleParameters = (opts: {
+  sendAtDescription: string;
+  modeDescription: string;
+  promptHintDescription: string;
+  recurrenceDescription: string;
+  abilities: SelfScheduleAbilities;
+}) => ({
   type: 'object',
   properties: {
-    send_at: {
-      type: 'string',
-      description: `开始生成的时间，写你本地的墙钟时间、不带时区后缀（如 ${example}），系统按你所在的时区理解。至少比当前时间晚 1 分钟。排之前先想想对方那边是几点——你们之间可能有时差，别把消息排到对方的深夜。`,
-    },
+    send_at: { type: 'string', description: opts.sendAtDescription },
     mode: {
       type: 'string',
       enum: ['auto', 'prompted'],
-      description: '生成模式。auto=到点根据那时的上下文自由发挥；prompted=围绕 prompt_hint 的方向说。默认 auto。',
+      description: opts.modeDescription,
     },
-    prompt_hint: {
-      type: 'string',
-      description: '给未来那条消息的方向，如"接着刚才那只猫的话往下说""告诉他汤炖好了"。mode=prompted 时必填。',
-    },
-    recurrence: {
-      type: 'string',
-      enum: ['none', 'daily', 'weekly'],
-      description: '重复类型。none=一次性（默认）；daily/weekly=每天/每周同一时间。',
-    },
-    expire_policy: {
-      type: 'string',
-      enum: ['expire', 'force'],
-      description: EXPIRE_POLICY_DESCRIPTION,
-    },
+    prompt_hint: { type: 'string', description: opts.promptHintDescription },
+    ...(opts.abilities.allowRecurring
+      ? {
+        recurrence: {
+          type: 'string',
+          enum: ['none', 'daily', 'weekly'],
+          description: opts.recurrenceDescription,
+        },
+      }
+      : {}),
+    ...(opts.abilities.allowForce
+      ? {
+        expire_policy: {
+          type: 'string',
+          enum: ['expire', 'force'],
+          // 与前台共用一份：同一个策略在两个入口说两套话，角色的选择会跟着入口漂。
+          description: EXPIRE_POLICY_DESCRIPTION,
+        },
+      }
+      : {}),
   },
   required: ['send_at'],
 });
 
-export const buildFireScheduleTool = (opts: FireScheduleTimeOpts): FireScheduleToolDef => ({
+const buildParameters = (example: string, abilities: SelfScheduleAbilities) => buildScheduleParameters({
+  sendAtDescription: `开始生成的时间，写你本地的墙钟时间、不带时区后缀（如 ${example}），系统按你所在的时区理解。至少比当前时间晚 1 分钟。排之前先想想对方那边是几点——你们之间可能有时差，别把消息排到对方的深夜。`,
+  modeDescription: '生成模式。auto=到点根据那时的上下文自由发挥；prompted=围绕 prompt_hint 的方向说。默认 auto。',
+  promptHintDescription: '给未来那条消息的方向，如"接着刚才那只猫的话往下说""告诉他汤炖好了"。mode=prompted 时必填。',
+  recurrenceDescription: '重复类型。none=一次性（默认）；daily/weekly=每天/每周同一时间。',
+  abilities,
+});
+
+export const buildFireScheduleTool = (
+  opts: FireScheduleTimeOpts & { abilities: SelfScheduleAbilities },
+): FireScheduleToolDef => ({
   type: 'function',
   function: {
     name: AMSG_FIRE_SCHEDULE_TOOL,
     description: FIRE_TOOL_DESCRIPTION,
     parameters: buildParameters(
       buildSendAtExample(opts.nowMs, opts.tz),
+      opts.abilities,
     ) as unknown as Record<string, unknown>,
   },
 });
@@ -158,7 +188,13 @@ export const buildFireRenewTool = (opts: FireScheduleTimeOpts): FireScheduleTool
  * 反而勾引模型往正文里写（与 buildMcpFireBlock 同一个判断）。text 模式（用户的中转拒
  * tools）才教语法。
  */
-export const buildFireScheduleBlock = (mode: 'native' | 'text', opts: FireScheduleTimeOpts): string => {
+export const buildFireScheduleBlock = (
+  mode: 'native' | 'text',
+  opts: FireScheduleTimeOpts & {
+    /** 「用户给你定的规矩」那一段（amsgLimits.buildLimitsBrief），接在块尾。 */
+    limitsBrief?: string;
+  },
+): string => {
   const howTo = mode === 'native'
     ? `需要时通过系统的工具调用接口发起 ${AMSG_FIRE_SCHEDULE_TOOL}，不要把工具名和参数写进正文。`
     : `需要时单独输出一行 ${AMSG_FIRE_SCHEDULE_TOOL}({"send_at":"${
@@ -175,6 +211,7 @@ export const buildFireScheduleBlock = (mode: 'native' | 'text', opts: FireSchedu
     // 对方那边此刻几点写在【当前时刻补充】里（有时差时才有那一行）。
     '定时间之前先想想对方那边是几点：你们之间可能有时差，别把消息排到对方的深夜。',
     '没必要就别排。为了排而排出来的后续，读起来就是没话找话。',
+    ...(opts.limitsBrief ? [opts.limitsBrief] : []),
   ].join('\n');
 };
 

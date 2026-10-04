@@ -5,6 +5,7 @@ import type { BuildChatPayloadInput } from './chatRequestPayload';
 import { RealtimeContextManager } from './realtimeContext';
 import { installSARModuleOnCharacter, installSARModuleOnUser } from './vrWorld/sarModuleRuntime';
 import { SAR_MODULE_CATALOG } from './vrWorld/sarModuleShop';
+import { ChatPrompts } from './chatPrompts';
 
 // 即时对话（这一轮交给用户自己的 amsg worker 生成）那份 prompt 里，凡是 worker 到点
 // 会自己补一遍的时效段，前端就不再烤进去：当前时间块、【真实世界感知系统】（节日 /
@@ -35,6 +36,44 @@ const baseInput = (): BuildChatPayloadInput => ({
 
 const joinMessages = (messages: Array<{ content: any }>): string =>
     messages.map(m => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');
+
+it('本地仅节假日感知可独立注入一句，云端生成不烤进本地提醒', async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(2026, 8, 27, 12));
+    const input = baseInput();
+    input.realtimeConfig = { ...realtimeConfig, weatherEnabled: false, newsEnabled: false, userHolidays: { enabled: true, countryCode: 'CN' } };
+    const reminder = '小明所在地中国 2026-09-27 为中秋节公共假期，实际休息与否以小明自己的日程和说明为准。';
+    vi.spyOn(RealtimeContextManager, 'getUserHoliday').mockResolvedValue(reminder);
+    const local = await buildChatRequestPayload(input);
+    expect(joinMessages(local.fullMessages)).toContain(reminder);
+    expect(RealtimeContextManager.getUserHoliday).toHaveBeenCalledWith(input.realtimeConfig, '小明');
+    const disabled = await buildChatRequestPayload({ ...input, char: { ...input.char, timeAwarenessEnabled: false } });
+    expect(joinMessages(disabled.fullMessages)).not.toContain(reminder);
+    const cloud = await buildChatRequestPayload({ ...input, timelyByWorker: true });
+    expect(joinMessages(cloud.fullMessages)).not.toContain(reminder);
+    vi.useRealTimers();
+});
+
+it('keeps this request history when the archive waterline advances during async prompt construction', async () => {
+    const input = baseInput();
+    input.char = { ...input.char, autoArchiveEnabled: true, contextRangeMode: 'adaptive' };
+    const key = `mp_lastMsgId_${input.char.id}`;
+    localStorage.setItem(key, '0');
+    const original = ChatPrompts.buildSystemPromptParts;
+    vi.spyOn(ChatPrompts, 'buildSystemPromptParts').mockImplementation(async (...args) => {
+        const result = await original(...args);
+        localStorage.setItem(key, '99999');
+        return result;
+    });
+    try {
+        const payload = await buildChatRequestPayload(input);
+        expect(payload.cleanedApiMessages.some(m => m.role === 'user' && String(m.content).includes('在吗'))).toBe(true);
+        expect(localStorage.getItem(key)).toBe('99999');
+        // 新请求仍须遵守推进后的水位，不能把快照变成永久绕过。
+        const next = await buildChatRequestPayload(input);
+        expect(next.cleanedApiMessages).toEqual([]);
+        expect(localStorage.getItem(key)).toBe('99999');
+    } finally { localStorage.removeItem(key); }
+});
 
 beforeEach(() => {
     // 天气/热搜真去联网太慢也不稳定，桩成固定内容；测的是「这一段进没进 prompt」。
@@ -312,4 +351,29 @@ it('ChatApp user modules explicitly identify the pending messages without changi
     expect(request?.content).toContain(JSON.stringify(input.historyMsgs.map(({ id, content }) => ({ id, content }))));
     const other = await buildChatRequestPayload(input);
     expect(joinMessages(other.fullMessages)).not.toContain('USER_SURFACE 的聊天专用格式');
+});
+
+it('聊天深度世界书由消息层插入，公共上下文兜底不会再重复一份', async () => {
+    const input = baseInput();
+    input.char.mountedWorldbooks = [{ id: 'depth-test', title: '深度测试', content: 'UNIQUE_DEPTH_BOOK', constant: true, position: 4, depth: 0, role: 0 }];
+    const payload = await buildChatRequestPayload(input);
+    expect(joinMessages(payload.fullMessages).split('UNIQUE_DEPTH_BOOK')).toHaveLength(2);
+    expect(payload.fullMessages[0].content).not.toContain('UNIQUE_DEPTH_BOOK');
+});
+
+it('单串提示词消费者也从同一管线拿到深度世界书', async () => {
+    const input = baseInput();
+    input.char.mountedWorldbooks = [{ id: 'text-depth', title: '单串深度', content: 'TEXT_ONLY_DEPTH_BOOK', constant: true, position: 4 }];
+    const result = await ChatPrompts.buildSystemPrompt(input.char, input.userProfile, [], [], [], input.historyMsgs);
+    expect(result.split('TEXT_ONLY_DEPTH_BOOK')).toHaveLength(2);
+});
+
+it('文本入口误传 history 时仍保留深度世界书，不丢弃移交后的消息', async () => {
+    const input = baseInput();
+    input.char.mountedWorldbooks = [{ id: 'text-depth', title: '单串深度', content: 'TEXT_ONLY_DEPTH_BOOK', constant: true, position: 4 }];
+    const result = await ChatPrompts.buildSystemPrompt(
+        input.char, input.userProfile, [], [], [], input.historyMsgs,
+        undefined, undefined, undefined, undefined, undefined, { history: [] },
+    );
+    expect(result.split('TEXT_ONLY_DEPTH_BOOK')).toHaveLength(2);
 });

@@ -1,3 +1,5 @@
+import { resolveDialogueApi } from '../utils/characterApi';
+import {ChatCardSurface} from '../components/chat/ChatCardSurface';
 import { avatarDecorationImageStyle, isAnniversaryFrame } from '../utils/anniversaryGifts';
 import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
@@ -21,7 +23,7 @@ import { parseDirectorActions, stripSkipMarker, parseGroupTopicBox } from '../ut
 import { GroupPacketMeta, PacketReceiptMeta, ClaimResult, claimPacket, effectivePacketStatus, makePacketMeta } from '../utils/groupChat/redpacket';
 import { messageLogText } from '../utils/groupChat/format';
 import { trackEvent } from '../utils/analytics';
-import { markAmsgStateDirty } from '../utils/amsgStateSync';
+import { markAmsgStateDirty, type AmsgDirtyReason } from '../utils/amsgStateSync';
 import { buildMemberTimeline, DEFAULT_MEMBER_TIMELINE_CAP } from '../utils/groupChat/timeline';
 import { buildEmojiContextStr, buildGroupHistoryBlock, buildDirectorInstruction, buildRoundRobinInstruction, GroupHistoryBlock } from '../utils/groupChat/prompts';
 import { dispatchMemberActions } from '../utils/groupChat/dispatch';
@@ -36,7 +38,8 @@ import { loadChatInputPreferences, saveChatInputPreferences } from '../utils/cha
 import ChatInputSettings from '../components/chat/ChatInputSettings';
 import { useChatAutoReply } from '../hooks/useChatAutoReply';
 import TokenImg from '../components/os/TokenImg';
-import { useBlobRefUrl, isBlobRef, getBlobForRef, migrateDataUrlToRef } from '../utils/blobRef';
+import { ImageViewer } from '../components/chat/ChatImage';
+import { useBlobRefUrl, migrateDataUrlToRef } from '../utils/blobRef';
 import { buildReplySnapshotContent } from '../utils/applyAssistantPostProcessing';
 import ChromeCssEditor from '../components/chat/ChromeCssEditor';
 import WhiteboxSoundEditor from '../components/chat/WhiteboxSoundEditor';
@@ -337,7 +340,7 @@ const GroupMessageItem = React.memo(({
                 return (
                     <div className="relative group cursor-pointer" onClick={(e) => {
                         if (selectionMode) handleClick(e);
-                        else onImageClick(msg.content);
+                        else { e.stopPropagation(); onImageClick(msg.content); }
                     }}>
                         <TokenImg value={msg.content} className="max-w-[200px] max-h-[200px] rounded-xl shadow-sm border border-black/5" loading="lazy" />
                     </div>
@@ -460,7 +463,7 @@ const GroupMessageItem = React.memo(({
                         <span className="sully-chat-message-sender text-[10px] text-slate-400 ml-1 mb-1">{name}</span>
                     )}
                     <div className={selectionMode ? 'pointer-events-none' : ''}>
-                        {renderContent()}
+                        <ChatCardSurface message={msg}>{renderContent()}</ChatCardSurface>
                     </div>
                     {isLastInGroup && showTimestamp !== 'never' && (
                         <span className={`absolute top-full ${isUser ? 'right-0' : 'left-0'} mt-0.5 px-1 text-[9px] text-slate-400/80 font-medium whitespace-nowrap pointer-events-none ${showTimestamp === 'hover' ? 'opacity-0 group-hover:opacity-100 transition-opacity' : ''}`}>{timeStr}</span>
@@ -493,6 +496,17 @@ const GroupChat: React.FC = () => {
     const [isInputFocused, setIsInputFocused] = useState(false);
     const [isTyping, setIsTyping] = useState(false);
     const [mcpStatus, setMcpStatus] = useState('');
+    // 世界书只由公共管线解析一次，群历史保留独立消息边界；附图仍由原有流程处理。
+    const buildGroupRequestMessages = (members: CharacterProfile[], prompt: string, history: GroupHistoryBlock) =>
+        ContextBuilder.buildGroupWorldbookRequest<{ role: string; content: any }>({
+            members, user: userProfile, history: history.messages || [],
+            render: (slots, messages) => [
+                { role: 'system', content: slots.before + prompt + slots.after },
+                ...messages,
+                { role: 'user', content: buildUserMessageContent('请按以上规则继续本轮群聊。', history) },
+            ],
+        });
+
     /** 群公共话题盒整理状态——非空时显示顶部胶囊状态条 */
     const [groupPalaceStatus, setGroupPalaceStatus] = useState<string>('');
 
@@ -509,10 +523,10 @@ const GroupChat: React.FC = () => {
     // 历史里写卡片 —— 两者都是主动消息 2.0 云端快照（fire_pack）的素材。群里有事就给成员
     // 逐个打脏，不然角色到点还活在上一次私聊那会儿的群里。同一轮里的多次调用会在微任务内
     // 合并成一次上传，没开主动消息的成员被 markAmsgStateDirty 内部的门筛掉。
-    const markGroupMembersDirty = useCallback((memberIds: string[]) => {
+    const markGroupMembersDirty = useCallback((memberIds: string[], reason: AmsgDirtyReason = 'refresh') => {
         for (const memberId of memberIds) {
             const member = charactersRef.current.find(c => c.id === memberId);
-            if (member) markAmsgStateDirty({ char: member, userProfile, groups, realtimeConfig });
+            if (member) markAmsgStateDirty({ char: member, userProfile, groups, realtimeConfig }, reason);
         }
     }, [userProfile, groups, realtimeConfig]);
 
@@ -893,6 +907,11 @@ const GroupChat: React.FC = () => {
         setMessages(remaining);
         setTotalMsgCount(remaining.length);
 
+        // 群里说过的话会进每个成员私聊 fire_pack 的【群聊背景】块，所以清空群聊之后，
+        // 成员在云端那份快照里还带着这段刚被删掉的群聊。这条路以前一次打脏都没有，
+        // 用 invalidate 是因为没有待触发任务的成员轮不到重传，普通打脏会被门丢掉。
+        markGroupMembersDirty(activeGroup.members || [], 'invalidate');
+
         addToast(`已清理 ${msgsToDelete.length} 条记录${preserveContext ? ' (保留最近10条)' : ''}`, 'success');
         trackEvent('清空群聊记录', { preserve: preserveContext ? 'on' : 'off' });
         setModalType('none');
@@ -1004,17 +1023,9 @@ const GroupChat: React.FC = () => {
         setModalType('packet-detail');
     }, []);
 
-    // 点图看大图：新标签页只认得真正的 URL，blobref 令牌得先换成 objectURL 再开
-    // （data: 顶层导航被浏览器挡，只能走 objectURL）。开完不立刻回收——新标签页还在
-    // 用它加载；留一分钟再 revoke，图早读完了，也不至于把整张图一直挂在内存里。
-    const handleGroupImageClick = useCallback(async (url: string) => {
-        if (!isBlobRef(url)) { window.open(url, '_blank'); return; }
-        const blob = await getBlobForRef(url);
-        if (!blob) { addToast('图片数据已丢失', 'error'); return; }
-        const objectUrl = URL.createObjectURL(blob);
-        window.open(objectUrl, '_blank');
-        setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
-    }, [addToast]);
+    // 应用内预览，避免移动浏览器打开 blob 新页时白屏或被拦截。
+    const [previewImage, setPreviewImage] = useState<string | null>(null);
+    const handleGroupImageClick = useCallback((url: string) => setPreviewImage(url), []);
     const handleGroupReply = useCallback((target: Message) => { setReplyTarget(target); trackEvent('引用回复一条群消息'); }, []);
 
     // 用户抢/收/退：updater 内重跑状态机（以库内最新 claims 判重，防与 AI 派发并发双写）
@@ -1165,7 +1176,7 @@ const GroupChat: React.FC = () => {
         const weekNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
         const currentTimeStr = `${nowDate.getFullYear()}年${nowDate.getMonth() + 1}月${nowDate.getDate()}日 ${weekNames[nowDate.getDay()]} ${virtualTime.hours.toString().padStart(2, '0')}:${virtualTime.minutes.toString().padStart(2, '0')}`;
         const liveMsgs = currentMsgs.filter(m => m.id > (activeGroup?.archivedThroughMessageId || 0));
-        const sharedScene = ContextBuilder.buildGroupSharedScene(groupMembers, userProfile, liveMsgs);
+        const sharedScene = ContextBuilder.buildGroupSharedScene(groupMembers.map(member => ({ ...member, mountedWorldbooks: [] })), userProfile, liveMsgs);
 
         const header = `【系统：群聊模拟器配置】
 当前群名: "${activeGroup?.name}"
@@ -1189,7 +1200,7 @@ ${sharedScene.text}${activeGroup ? buildGroupTopicContext(activeGroup) : ''}`;
         const palaceQueryMsgs = liveGroupMsgs.slice(-30).filter(m => !m.type || m.type === 'text');
         await injectMemoryPalace(member, palaceQueryMsgs, undefined, userProfile.name);
         // 角色块：跳过共享场景已包含的部分（用户档案 / 共有 worldview / 共有世界书）
-        const coreContext = ContextBuilder.buildCoreContext(member, userProfile, true, undefined, {
+        const coreContext = ContextBuilder.buildCoreContext({ ...member, mountedWorldbooks: [] }, userProfile, true, undefined, {
             skipUserProfile: true,
             skipWorldview: sharedScene.worldviewIsShared,
             skipWorldbookIds: sharedScene.sharedWorldbookIds,
@@ -1412,14 +1423,14 @@ ${memberTimeline || '(暂无互动记录)'}
             const htmlPromptExt = activeGroup.htmlModeEnabled
                 ? `\n\n【群聊 HTML 适配】[html]...[/html] 块要写在某个角色自己的 content 字符串内部；HTML 属性一律用单引号（如 <div style='...'>），避免双引号破坏外层 JSON。\n${buildHtmlPrompt(activeGroup.htmlModeCustomPrompt)}`
                 : '';
-            const prompt = `${context}\n\n${buildDirectorInstruction(history, emojiContextStr)}${htmlPromptExt}\n`;
+            const prompt = `${context}\n\n${buildDirectorInstruction({ ...history, text: '（见下方独立消息历史）' }, emojiContextStr)}${htmlPromptExt}\n`;
 
             const data = await completeGroupChatWithMcp({
                 url: `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`,
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: {
                     model: apiConfig.model,
-                    messages: [{ role: "user", content: buildUserMessageContent(prompt, history) }],
+                    messages: buildGroupRequestMessages(groupMembers, prompt, history),
                     temperature: 0.9, // High creativity for banter
                     max_tokens: 8000
                 },
@@ -1487,10 +1498,6 @@ ${memberTimeline || '(暂无互动记录)'}
     // 单成员失败只跳过该成员，不杀整轮。
     const triggerRoundRobin = async (currentMsgs: Message[]) => {
         if (!activeGroup) return;
-        if (!apiConfig.apiKey) {
-            addToast('请先在设置里填好 API', 'error');
-            return;
-        }
         setIsTyping(true);
         const abort = new AbortController();
         abortRef.current = abort;
@@ -1506,6 +1513,8 @@ ${memberTimeline || '(暂无互动记录)'}
             for (const member of groupMembers) {
                 if (abort.signal.aborted) break;
                 try {
+                    const dialogueApi = resolveDialogueApi(apiConfig, member);
+                    if (!dialogueApi.baseUrl || !dialogueApi.model) throw new Error("请配置该角色或设置中的 API");
                     // 每位成员基于"此刻"的群历史构建上下文——包含本轮先发言成员的新消息
                     const { header, sharedScene } = buildGroupSystemHeader(roundMsgs, groupMembers);
                     const memberBlock = await buildMemberBlock(member, roundMsgs, sharedScene);
@@ -1527,15 +1536,16 @@ ${memberTimeline || '(暂无互动记录)'}
                     const htmlPromptExt = activeGroup.htmlModeEnabled
                         ? `\n\n${buildHtmlPrompt(activeGroup.htmlModeCustomPrompt)}`
                         : '';
-                    const prompt = `${header}${memberBlock}\n\n${buildRoundRobinInstruction(member.name, history, emojiContextStr)}${htmlPromptExt}\n`;
+                    const prompt = `${header}${memberBlock}\n\n${buildRoundRobinInstruction(member.name, { ...history, text: '（见下方独立消息历史）' }, emojiContextStr)}${htmlPromptExt}\n`;
 
                     const data = await completeGroupChatWithMcp({
-                        url: `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`,
-                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
+                        url: `${dialogueApi.baseUrl.replace(/\/+$/, '')}/chat/completions`,
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${dialogueApi.apiKey || 'sk-none'}` },
                         body: {
-                            model: apiConfig.model,
-                            messages: [{ role: "user", content: buildUserMessageContent(prompt, history) }],
-                            temperature: 0.9,
+                            model: dialogueApi.model,
+                            messages: buildGroupRequestMessages([member], prompt, history),
+                            temperature: dialogueApi.temperature ?? 0.9,
+                            stream: dialogueApi.stream ?? false,
                             max_tokens: 2000
                         },
                         groupId: activeGroup.id,
@@ -1558,12 +1568,7 @@ ${memberTimeline || '(暂无互动记录)'}
                         });
                     }
 
-                    let text = String(data.choices?.[0]?.message?.content ?? '').trim();
-                    // 剥模型自作主张加的名字前缀（提示词禁止了，但仍要兜底）
-                    if (text.startsWith(`${member.name}:`) || text.startsWith(`${member.name}：`)) {
-                        text = text.slice(member.name.length + 1).trim();
-                    }
-                    const { skipped, content } = stripSkipMarker(text);
+                    const { skipped, content } = stripSkipMarker(String(data.choices?.[0]?.message?.content ?? ''), member.name);
                     if (skipped) continue; // 本轮潜水
 
                     await dispatchMemberActions([{ charId: member.id, content }], {
@@ -1923,6 +1928,7 @@ ${memberTimeline || '(暂无互动记录)'}
 
             {/* 输入区 — 复用私聊 ChatInputArea（输入/表情面板/多选删除随 OS 外观设置），
                 actions 面板整体替换为群聊自己的 4 格 */}
+            {previewImage && <ImageViewer value={previewImage} fallback={previewImage} onClose={() => setPreviewImage(null)} />}
             <ChatInputArea
                 input={input}
                 setInput={setInput}
