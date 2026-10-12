@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react';
 import { execSync } from 'node:child_process';
 import { bakeVoiceMiddleware } from './server/bake-voice-middleware';
 import { staticCachePlugin } from './scripts/static-cache-build';
+import { startupRecoveryPlugin } from './scripts/startup-recovery-plugin';
 import { APP_VERSION_TAG } from './utils/appVersion';
 
 // MiniMax 国服 / 海外是两套域名，前端每个请求都带 X-MiniMax-Region 头说明走哪边。
@@ -83,6 +84,7 @@ export default defineConfig({
     ],
   },
   plugins: [
+    startupRecoveryPlugin(appBuildId),
     react(),
     staticCachePlugin({ buildId: appBuildId, appVersion: APP_VERSION_TAG }),
     {
@@ -144,7 +146,9 @@ export default defineConfig({
           const parsed = new URL(path, 'http://localhost');
           const voiceId = parsed.searchParams.get('voice_id') || '';
           const outputFormat = parsed.searchParams.get('output_format') || 'mp3_44100_128';
-          return `/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream?output_format=${encodeURIComponent(outputFormat)}`;
+          const endpoint = parsed.searchParams.get('mode') === 'dialogue' ? 'text-to-dialogue' : `text-to-speech/${encodeURIComponent(voiceId)}`;
+          const timing = parsed.searchParams.get('timestamps') === '1' ? '/with-timestamps' : '';
+          return `/v1/${endpoint}/stream${timing}?output_format=${encodeURIComponent(outputFormat)}`;
         },
       },
     }
@@ -154,6 +158,7 @@ export default defineConfig({
     assetsDir: 'assets/build',
     chunkSizeWarningLimit: 2000,
     rollupOptions: {
+      input: { main: 'index.html', wardrobe: 'chibi-wardrobe.html' },
       // 关键修复：将这些包排除在打包之外，让浏览器通过 index.html 的 importmap 加载
       external: ['katex'],
       onwarn(warning, defaultHandler) {
@@ -164,6 +169,12 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (id.includes('node_modules')) {
+            // This SDK core is dependency-free. Keep its initialized constants
+            // outside vendor-react: memory-palace initializes a store at module
+            // scope and can run before that cyclic vendor chunk's var defaults.
+            if (/[\\/]@rei-standard[\\/]blob-store[\\/]dist[\\/]index\.mjs$/.test(id)) {
+              return 'vendor-blob-store';
+            }
             // Only load the image renderer when exporting a beauty preview.
             if (id.includes('html2canvas')) return 'beauty-preview-renderer';
             // Local camera emotion calibration is opt-in. Keep MediaPipe out of
@@ -172,9 +183,15 @@ export default defineConfig({
             if (id.includes('@mediapipe/tasks-vision')) {
               return 'vendor-mediapipe';
             }
-            // VRM/Three 只在懒加载的 CallApp 视频模式使用。单独成包，避免 3D 引擎
+            // Optional parsers and UI must stay out of the eagerly loaded common vendor.
+            if (/[\\/]node_modules[\\/]animal-island-ui[\\/]/.test(id)) return 'vendor-island';
+            if (/[\\/]node_modules[\\/]ag-psd[\\/]/.test(id)) return 'vendor-psd';
+            if (/[\\/]node_modules[\\/]pdfjs-dist[\\/]/.test(id)) return 'vendor-pdf';
+            // BVH imports Three: leaving it in common vendor pulls the 3D engine
+            // back into desktop startup, even when application imports are lazy.
+            // VRM/Three 用于按需打开的 3D 小屋及通话。单独成包，避免 3D 引擎
             // 被通用 vendor 首屏加载，普通聊天/桌面用户无需支付这部分体积。
-            if (id.includes('@pixiv/three-vrm') || /[\\/]node_modules[\\/]three[\\/]/.test(id)) {
+            if (id.includes('@pixiv/three-vrm') || /[\\/]node_modules[\\/](?:three|three-mesh-bvh)[\\/]/.test(id)) {
               return 'vendor-vrm';
             }
             // The Cubism adapter checks window.Live2DCubismCore at module evaluation
@@ -200,9 +217,9 @@ export default defineConfig({
             }
             return 'vendor';
           }
-          if (id.includes('utils/memoryPalace')) {
-            return 'memory-palace';
-          }
+          // Let Rollup place application modules by their real dependency graph.
+          // Forcing memoryPalace into one chunk also hoists shared contexts and
+          // creates application -> React vendor -> application startup cycles.
         }
       }
     }

@@ -1,7 +1,9 @@
+import {playWhiteboxSound,unlockWhiteboxAudio} from '../../utils/whiteboxSound';
 import {resolveCssImageUrls} from '../../utils/cssImageAssets';
 import {decorationPreviewScenes,decorationThumbnailPart,type DecorationThumbnailPart} from '../../utils/decorationPreviewScenes';
 import React, { forwardRef, memo, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import {embedBeautyCaptureImages} from '../../utils/beautyCaptureAssets';
+import {renderIsolatedBeautyCapture, waitForBeautyCapture, waitForBeautyCaptureFonts} from '../../utils/beautyCaptureWait';
 import {enqueuePreviewBuild} from '../../utils/previewRenderQueue';
 import { beautyPreviewDocument, PREVIEW_WIDTH, PREVIEW_HEIGHT } from '../../utils/beautyPreview';
 import {bindDecorationPreview,type DecorationPreviewState} from '../../utils/decorationPreviewInteraction';
@@ -38,11 +40,14 @@ function copyPaint(element: Element, scrolls: Array<[HTMLElement,number,number]>
 export default memo(forwardRef<BeautyPreviewHandle, Props>(function BeautyPresetPreview({ data, compact = false, sceneScope = 'preset', thumbnailPart }, ref) {
   const host = useRef<HTMLDivElement>(null);
   const container = useRef<HTMLDivElement>(null);
+  const activeCapture = useRef<AbortController|null>(null);
+  useEffect(() => () => activeCapture.current?.abort(), []);
   const [width, setWidth] = useState(PREVIEW_WIDTH);
   const [desktopPage, setDesktopPage] = useState(0);
   const [desktopPages, setDesktopPages] = useState(1);
   useEffect(() => { setDesktopPage(0); setDesktopPages(1); }, [data]);
   const isChat = (data as any)?.format === 'sullyos-chat-decoration';
+  const soundOnly=compact&&isChat&&Object.keys((data as any).parts||{}).length===1&&Object.hasOwn((data as any).parts,'sound');
   const part = compact && isChat && thumbnailPart!=='full' ? thumbnailPart||decorationThumbnailPart(data) : undefined;
   const height = part==='psyche' ? 180 : part ? PREVIEW_WIDTH : isChat ? PREVIEW_HEIGHT : 720;
   const [scene, setScene] = useState(()=>(data as any)?.parts?.psyche && Object.keys((data as any).parts).length===1 ? 'psyche' : 'conversation');
@@ -62,7 +67,7 @@ export default memo(forwardRef<BeautyPreviewHandle, Props>(function BeautyPreset
     return()=>observer.disconnect();
   },[compact]);
   useEffect(() => {
-    if(!visible)return;
+    if(!visible||soundOnly)return;
     setReady(false); setError('');
     let alive = true;let cleanup:undefined|(()=>void);let releaseImages:undefined|(()=>void);
     const build = async () => { try {
@@ -97,7 +102,7 @@ export default memo(forwardRef<BeautyPreviewHandle, Props>(function BeautyPreset
     const cancel=compact?enqueuePreviewBuild(build):undefined;
     if(!compact)void build();
     return () => {alive=false;cancel?.();cleanup?.();releaseImages?.();};
-  }, [data,sceneId,isChat,compact,part,height,liveState,desktopPage,visible]);
+  }, [data,sceneId,isChat,compact,part,height,liveState,desktopPage,visible,soundOnly]);
   useEffect(() => {
     if (!container.current) return;
     const observer = new ResizeObserver(entries => setWidth(Math.min(PREVIEW_WIDTH, entries[0].contentRect.width)));
@@ -107,27 +112,27 @@ export default memo(forwardRef<BeautyPreviewHandle, Props>(function BeautyPreset
     capture: async () => {
       const element = host.current;
       if (!ready || !element?.shadowRoot) throw Error('预览尚未加载完成，请稍后再试');
-      await document.fonts.ready;
-      const { default: html2canvas } = await import('html2canvas');
       const body = element.shadowRoot.querySelector<HTMLElement>('.beauty-preview-body');
       if (!body) throw Error('预览内容尚未就绪');
-      const scrolls:Array<[HTMLElement,number,number]>=[];
-      const snapshot = copyPaint(body,scrolls);
-      const holder = document.createElement('div');
-      holder.style.cssText = `position:fixed;left:-10000px;top:0;width:360px;height:${height}px;overflow:hidden;pointer-events:none;contain:strict`;
-      holder.append(snapshot); document.body.append(holder);
-      for(const [element,top,left] of scrolls){element.scrollTop=top;element.scrollLeft=left;}
+      activeCapture.current?.abort();
+      const controller = new AbortController(); activeCapture.current = controller;
+      let stage = '预览字体加载';
+      const timeout = window.setTimeout(() => controller.abort(Error(`${stage}超时，请检查网络后重试；不会提交未完成的封面。`)), 30000);
       try {
-        await embedBeautyCaptureImages(snapshot);
-        // html2canvas flattens Shadow DOM into its clone. Exclude all original previews
-        // so untrusted selectors cannot see the rest of the app in that temporary clone.
-        // The foreignObject painter serializes the element at a one-pixel inset.
-        // Cancel the temporary holder's off-screen coordinates without clipping it.
-        const bounds = snapshot.getBoundingClientRect();
-        return await html2canvas(snapshot, { x: 1 - bounds.left, y: 1 - bounds.top, scale: 2, width: PREVIEW_WIDTH, height, backgroundColor: null, foreignObjectRendering: true, useCORS: true, imageTimeout: 8000, logging: false, ignoreElements: node => node.hasAttribute('data-beauty-preview-source') });
-      } finally { holder.remove(); }
+        await waitForBeautyCaptureFonts(body, controller.signal);
+        const scrolls:Array<[HTMLElement,number,number]>=[];
+        const snapshot = copyPaint(body,scrolls);
+        stage = '封面图片加载';
+        await waitForBeautyCapture(embedBeautyCaptureImages(snapshot, controller.signal), controller.signal);
+        stage = '封面绘制';
+        return await renderIsolatedBeautyCapture(snapshot, PREVIEW_WIDTH, height, controller.signal, scrolls);
+      } finally {
+        clearTimeout(timeout);
+        if (activeCapture.current === controller) activeCapture.current = null;
+      }
     },
   }), [ready,height]);
+  if(soundOnly)return <div className="beauty-preset-preview" data-thumbnail-part="sound" style={{display:'grid',placeItems:'center',aspectRatio:'1',color:'#8b829a',background:'#efedf4'}}><svg aria-hidden="true" viewBox="0 0 80 48" width="60%" fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round"><path d="M8 21v6m10-12v18m11-23v28m11-34v40m11-32v24m11-19v14m10-10v6"/></svg><small>{(data as any).parts.sound?.src && (data as any).parts.sound.src!=='none'?'提示音 · 点开试听':'静音'}</small></div>;
   return <div className="beauty-preset-preview" data-thumbnail-part={part} ref={container}>
     {!isChat && !compact && desktopPages > 1 && <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:16,marginBottom:10}}>
       <button type="button" aria-label="上一页桌面" title="上一页桌面" disabled={desktopPage === 0} onClick={() => setDesktopPage(p => p - 1)}>←</button>
@@ -135,6 +140,7 @@ export default memo(forwardRef<BeautyPreviewHandle, Props>(function BeautyPreset
       <button type="button" aria-label="下一页桌面" title="下一页桌面" disabled={desktopPage >= desktopPages - 1} onClick={() => setDesktopPage(p => p + 1)}>→</button>
     </div>}
     {isChat && !compact && scenes.length>1 && <div style={{display:'flex',alignItems:'center',gap:5,marginBottom:10,fontSize:12,color:'#666'}}><select aria-label="预览聊天内容" value={sceneId} onChange={event=>setScene(event.target.value)} style={{flex:1,minWidth:0,padding:'8px 10px',borderRadius:8,background:'#f2f2f2',color:'#333'}}>{scenes.map(item=><option key={item.id} value={item.id}>{item.label}</option>)}</select><button type="button" aria-label="上一条预览" title="上一条预览" disabled={sceneIndex<=0} onClick={()=>setScene(scenes[sceneIndex-1].id)} style={{padding:0,width:32,minHeight:36,flexShrink:0}}>↑</button><button type="button" aria-label="下一条预览" title="下一条预览" disabled={sceneIndex>=scenes.length-1} onClick={()=>setScene(scenes[sceneIndex+1].id)} style={{padding:0,width:32,minHeight:36,flexShrink:0}}>↓</button></div>}
+    {!compact && isChat && (data as any)?.parts?.sound?.src && (data as any).parts.sound.src!=='none' && <button type="button" onClick={()=>{unlockWhiteboxAudio();playWhiteboxSound((data as any).parts.sound);}}>试听提示音</button>}
     {error && <p role="alert">{error}</p>}
     <div style={{ height: height * width / PREVIEW_WIDTH, width, margin: 'auto', overflow: 'hidden', borderRadius: 20 }}>
       <div ref={host} data-beauty-preview-source role={isChat&&!compact?'group':'img'} aria-label="美化预设搭配预览" style={{ width: PREVIEW_WIDTH, height, transform: `scale(${width / PREVIEW_WIDTH})`, transformOrigin: 'top left' }}/>

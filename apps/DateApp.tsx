@@ -296,14 +296,14 @@ const DateApp: React.FC = () => {
             const msgs = await loadCharacterContextMessages(c);
             const preparedMsgs = await materializeVisionDescriptions(msgs, apiConfig.visionApi);
             const emojis = await DB.getEmojis();
-            const { messages } = DatePrompts.buildPeekPayload({
+            const { messages } = (await DatePrompts.buildPeekPayload({
                 char: c,
                 userProfile,
                 allMsgs: preparedMsgs,
                 emojis,
                 useVisionDescriptions: apiConfig.visionApi?.enabled === true,
                 openingMode: selectedOpening,
-            });
+            }));
             const content = await callLLM(messages, resolveDialogueApi(apiConfig, c).temperature ?? 0.85, c);
             if (requestId === peekRequestRef.current) setPeekStatus(content);
 
@@ -480,14 +480,14 @@ const DateApp: React.FC = () => {
         // 新消息也不带 isOpening，阅读模式会从上一次见面的开场开始切片，表现为
         // 「新见面只有立绘模式是新剧情，阅读模式全是旧剧情」。
         if (lastMsg.metadata?.isOpening === true) {
-            const { messages } = DatePrompts.buildPeekPayload({
+            const { messages } = (await DatePrompts.buildPeekPayload({
                 char,
                 userProfile,
                 allMsgs: preparedValidMsgs,
                 openingMode: lastMsg.metadata?.dateOpeningMode === 'invite' ? 'invite' : 'approach',
                 emojis,
                 useVisionDescriptions: apiConfig.visionApi?.enabled === true,
-            });
+            }));
             const content = await callLLM(messages, Math.max(resolveDialogueApi(apiConfig, char).temperature ?? 0.85, 0.9));
             // 生成成功后才动库：先删旧开场、再带 isOpening 落新开场，请求失败时原剧情不丢
             await DB.deleteMessage(lastMsg.id);
@@ -658,6 +658,27 @@ const DateApp: React.FC = () => {
         setMode('history');
         trackEvent('打开见面记录');
     };
+
+    useAppShortcut(ShortcutAppID.Date, (intent, isCurrent) => {
+        setCameFromChat(false);
+        setMeetSurface(intent.entryId === 'story' ? 'story' : 'companion');
+        const target = characters.find(c => c.id === intent.characterId);
+        if (!target) { setMode('select'); return; }
+        setActiveCharacterId(target.id);
+        setPreviousMode('select');
+        if (intent.entryId === 'history') {
+            setHistoryMessages([]); setMode('history');
+            setHistoryView('encounter'); setHistorySortOrder('newest'); setHistoryLoadLimit(DATE_HISTORY_MESSAGE_LIMIT);
+            void DB.getRecentMessagesByCharIdAndSource(target.id, 'date', DATE_HISTORY_MESSAGE_LIMIT).then(msgs => {
+                if (isCurrent()) { setHistoryMessages(msgs); setHistoryReachedEnd(msgs.length < DATE_HISTORY_MESSAGE_LIMIT); }
+            }).catch(() => { if (isCurrent()) addToast('见面记录读取失败，请重试', 'error'); });
+        } else if (intent.entryId === 'settings') setMode('settings');
+        else {
+            // Opening a shortcut must not discard savedDateState or generate an opening.
+            clearDateResumeAttempt(); encounterIdRef.current = crypto.randomUUID();
+            setDateMessages([]); setPeekStatus(''); setHasSavedOpening(false); setMode('entry');
+        }
+    });
 
     const handleLoadMoreHistory = async () => {
         if (!char || historyBusy || historyReachedEnd) return;
@@ -1251,3 +1272,5 @@ const DateApp: React.FC = () => {
 };
 
 export default DateApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

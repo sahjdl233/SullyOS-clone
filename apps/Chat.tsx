@@ -1,3 +1,6 @@
+import ChatRuntimeStyle from '../components/chat/ChatRuntimeStyle';
+import {homePhoneAppearance,HOME_PHONE_BUBBLES} from './room3d/homePhoneAppearance';
+
 import { publishReplyDisplay, stopReplyRuns } from '../utils/chatReplyCancellation';
 import { stopInstantChat } from '../utils/amsgInstantChat';
 import {resolvePsycheAppearance} from '../utils/psycheAppearance';
@@ -9,6 +12,7 @@ import { createPortal } from 'react-dom';
 import { useOS } from '../context/OSContext';
 import { DB } from '../utils/db';
 import { isVisibleChatMessage } from '../utils/chatMessageVisibility';
+import { chatCharacterDisplayName } from '../utils/characterRemark';
 import { AppID, Message, MessageType, MemoryFragment, Emoji, EmojiCategory, DailySchedule, ScheduleSlot } from '../types';
 import { processImageToBlob } from '../utils/file';
 import { safeResponseJson, extractContent } from '../utils/safeApi';
@@ -73,6 +77,9 @@ import {
     synthesizeSpeechDetailed,
 } from '../utils/ttsRouter';
 import { playVoiceAudio, primeVoiceAudio, stopVoiceAudio, voicePlaybackErrorMessage, shouldAutoGenerateVoice, shouldAutoPlayGeneratedVoice } from '../utils/voicePlayback';
+import { useStreamingVoice } from '../hooks/useStreamingVoice';
+import StreamingVoiceBar from '../components/voice/StreamingVoiceBar';
+import { streamElevenLabsSpeech, type StreamedVoice } from '../utils/elevenLabsStream';
 import { voiceLanguageAnalyticsValue, voiceLanguagePromptLabel } from '../utils/voiceLanguage';
 import { fetchBlobForShare, shareOrDownloadBlob } from '../utils/shareExport';
 import { CollaborationStore } from '../features/collaboration/store';
@@ -135,9 +142,11 @@ const HISTORY_WINDOW_BATCH_SIZE = 30;
 /** 即时对话那一轮回复「推送陆续到齐」的宽限时间，也就是自动合成的补扫窗口有多长（见下面的 auto-TTS effect）。 */
 const INSTANT_VOICE_SCAN_WINDOW_MS = 30_000;
 
-const Chat: React.FC = () => {
-    const { activeApp, characters, activeCharacterId, setActiveCharacterId, addCharacter, updateCharacter, updateUserProfile, apiConfig, apiPresets, availableModels, addApiPreset, closeApp, openApp, customThemes, addCustomTheme, removeCustomTheme, addWorldbook, updateTheme, saveAppearancePreset, addToast, showError, userProfile, lastMsgTimestamp, groups, characterGroups, clearUnread, unreadMessages, realtimeConfig, memoryPalaceConfig, updateMemoryPalaceConfig, remoteVectorConfig, syncEmotionApiToAllCharacters, theme: baseOsTheme, proactiveComposingChars, openDateWithChar } = useOS();
-    const osTheme = useMemo(()=>resolveDecorationTheme(baseOsTheme,characters.find(c=>c.id===activeCharacterId)||characters[0]),[baseOsTheme,characters,activeCharacterId]);
+export interface HomePhoneChatProps {characterId:string;getContext:()=>string;onBack:()=>void}
+const Chat: React.FC<{homePhone?:HomePhoneChatProps}> = ({homePhone}) => {
+    const { activeApp, characters, activeCharacterId: osActiveCharacterId, setActiveCharacterId, addCharacter, updateCharacter, updateUserProfile, apiConfig, apiPresets, availableModels, addApiPreset, closeApp, openApp, customThemes, addCustomTheme, removeCustomTheme, addWorldbook, updateTheme, saveAppearancePreset, addToast, showError, userProfile, lastMsgTimestamp, groups, characterGroups, clearUnread, unreadMessages, realtimeConfig, memoryPalaceConfig, updateMemoryPalaceConfig, remoteVectorConfig, syncEmotionApiToAllCharacters, theme: baseOsTheme, proactiveComposingChars, openDateWithChar } = useOS();
+    const activeCharacterId=homePhone?.characterId??osActiveCharacterId;
+    const osTheme = useMemo(()=>homePhone?homePhoneAppearance(baseOsTheme):resolveDecorationTheme(baseOsTheme,characters.find(c=>c.id===activeCharacterId)||characters[0]),[baseOsTheme,characters,activeCharacterId,!!homePhone]);
     const isProactiveComposing = !!(activeCharacterId && proactiveComposingChars[activeCharacterId]);
     const localDateKey = useLocalDateKey();
 
@@ -386,8 +395,8 @@ const Chat: React.FC = () => {
     const currentThemeId = char?.bubbleStyle || osTheme.chatDefaultBubbleStyle || 'default';
     // 解析逻辑抽到 utils/groupChat/theme.ts（群聊共用），行为不变
     const activeTheme = useMemo(
-        () => resolveChatTheme(currentThemeId, customThemes, PRESET_THEMES),
-        [currentThemeId, customThemes],
+        () => homePhone?HOME_PHONE_BUBBLES:resolveChatTheme(currentThemeId, customThemes, PRESET_THEMES),
+        [currentThemeId, customThemes,!!homePhone],
     );
     const draftKey = `chat_draft_${activeCharacterId}`;
 
@@ -435,6 +444,7 @@ const Chat: React.FC = () => {
     // --- Initialize Hook ---
     const { isTyping, streamingBubbles, streamingThinking, streamingHandoverIds, inboxStatus, recallStatus, searchStatus, diaryStatus, emotionStatus, memoryPalaceStatus, memoryPalaceResult, setMemoryPalaceResult, lastDigestResult, setLastDigestResult, lastTokenUsage, tokenBreakdown, setLastTokenUsage, triggerAI, startProactiveChat, stopProactiveChat, isProactiveActive } = useChatAI({
         char,
+        homePhoneContext:homePhone?.getContext,
         userProfile,
         apiConfig,
         groups,
@@ -457,10 +467,11 @@ const Chat: React.FC = () => {
     });
 
     // --- Voice TTS for chat messages ---
-    interface VoiceData { url: string; originalText: string; spokenText?: string; lang?: string; favorite?: boolean; }
+    interface VoiceData { url: string; originalText: string; spokenText?: string; lang?: string; favorite?: boolean; recording?: StreamedVoice; }
     // Persisted shape (IndexedDB assets store). `blob` is the raw audio;
     // `remoteUrl` is the fallback when fetching the MiniMax CDN blob was blocked by CORS.
     interface StoredVoice {
+        recording?: StreamedVoice;
         blob?: Blob;
         remoteUrl?: string;
         favorite?: boolean;
@@ -477,6 +488,15 @@ const Chat: React.FC = () => {
     const [voiceLoading, setVoiceLoading] = useState<Set<number>>(new Set());
     const [playingMsgId, setPlayingMsgId] = useState<number | null>(null);
     const chatAudioRef = useRef<HTMLAudioElement | null>(null);
+    const streamingVoice = useStreamingVoice(activeCharacterId);
+    const autoVoiceQueue = useRef<Promise<unknown>>(Promise.resolve());
+    const queuedVoices = useRef(new Set<number>());
+    const voiceQueueEpoch = useRef(0);
+    const voiceStreamAborts = useRef(new Map<number, AbortController>());
+    const stopStreamingVoice = () => {
+        voiceQueueEpoch.current += 1; streamingVoice.stop(); setPlayingMsgId(null);
+        voiceStreamAborts.current.forEach(abort => abort.abort()); voiceStreamAborts.current.clear();
+    };
     const voiceRequestsRef = useRef(new Set<number>());
     const voiceMountedRef = useRef(true);
     const prevIsTypingRef = useRef(false);
@@ -498,11 +518,12 @@ const Chat: React.FC = () => {
     /** Whether this character can synthesize real voice under the active TTS provider (key + a voice profile). */
     const isTtsReady = useCallback(() => canSynthesizeSpeech(char, apiConfig), [char, apiConfig]);
 
-    const persistVoice = async (msgId: number, url: string, blob: Blob | null, originalText: string, spokenText: string | undefined, lang: string | undefined) => {
+    const persistVoice = async (msgId: number, url: string, blob: Blob | null, originalText: string, spokenText: string | undefined, lang: string | undefined, recording?: StreamedVoice) => {
         try {
             const stored: StoredVoice = blob
                 ? { blob, originalText, spokenText, lang, favorite: false }
                 : { remoteUrl: url, originalText, spokenText, lang, favorite: false };
+            if (recording) stored.recording = recording;
             await DB.saveAssetRaw(voiceAssetKey(msgId), stored);
         } catch (e) {
             console.warn('[Chat] persist voice failed', e);
@@ -540,6 +561,17 @@ const Chat: React.FC = () => {
         return chatAudioRef.current;
     };
     const playChatVoice = (msgId: number, url: string) => {
+        stopStreamingVoice();
+        const recording = voiceDataMap[msgId]?.recording;
+        if (recording) {
+            stopVoiceAudio(prepareChatAudio());
+            const epoch = voiceQueueEpoch.current;
+            setPlayingMsgId(msgId);
+            void streamingVoice.replay(String(msgId), recording).catch(error => {
+                if (error.name !== 'AbortError') addToast(error.message, 'error');
+            }).finally(() => { if (epoch === voiceQueueEpoch.current) setPlayingMsgId(null); });
+            return;
+        }
         void playVoiceAudio(prepareChatAudio(), url, {
             onPlaying: () => setPlayingMsgId(msgId),
             onStopped: () => setPlayingMsgId(null),
@@ -548,6 +580,9 @@ const Chat: React.FC = () => {
     };
 
     const handlePlayVoice = (msgId: number) => {
+        if (streamingVoice.state?.id === String(msgId) && ['loading', 'playing'].includes(streamingVoice.state.status)) {
+            stopStreamingVoice(); return;
+        }
         const data = voiceDataMap[msgId];
         if (!data) {
             // No voice data yet — trigger TTS generation (e.g. placeholder voice bar clicked)
@@ -592,6 +627,7 @@ const Chat: React.FC = () => {
     };
 
     const handleManualTts = async (msg: Message, autoTriggered = false): Promise<GeneratedVoiceData | null> => {
+        if (!autoTriggered && apiConfig.ttsProvider === 'elevenlabs') streamingVoice.prime();
         if (voiceRequestsRef.current.has(msg.id)) return null;
         if (voiceDataMap[msg.id]) {
             if (autoTriggered) return null;
@@ -636,7 +672,13 @@ const Chat: React.FC = () => {
             return null;
         }
 
-        if (!autoTriggered) primeVoiceAudio(prepareChatAudio());
+        if (!autoTriggered) {
+            primeVoiceAudio(prepareChatAudio());
+            if (ttsProvider === 'elevenlabs') stopStreamingVoice();
+        }
+        const epoch = voiceQueueEpoch.current;
+        const abort = new AbortController();
+        if (ttsProvider === 'elevenlabs') voiceStreamAborts.current.set(msg.id, abort);
         voiceRequestsRef.current.add(msg.id);
         setVoiceLoading(prev => new Set(prev).add(msg.id));
         try {
@@ -692,7 +734,18 @@ const Chat: React.FC = () => {
 
             if (!spokenText || spokenText.length < 2) return null;
 
-            const { url: blobUrl, blob } = await synthesizeSpeechDetailed(spokenText, char, apiConfig, {
+            if (ttsProvider === 'elevenlabs' && (abort.signal.aborted || epoch !== voiceQueueEpoch.current || activeCharIdRef.current !== msg.charId)) return null;
+            const streamPlayback = ttsProvider === 'elevenlabs' && shouldAutoPlayGeneratedVoice({ autoTriggered, autoPlayEnabled: char.chatVoiceAutoPlay });
+            let recording: StreamedVoice | undefined;
+            if (streamPlayback) {
+                stopVoiceAudio(prepareChatAudio());
+                setPlayingMsgId(msg.id);
+                recording = await streamingVoice.speak(String(msg.id), spokenText, char, apiConfig, { languageBoost: voiceLang || undefined, emotion: voiceEmotion });
+                if (epoch === voiceQueueEpoch.current) setPlayingMsgId(null);
+            } else if (ttsProvider === 'elevenlabs') {
+                recording = await streamElevenLabsSpeech(spokenText, char, apiConfig, { signal: abort.signal, languageBoost: voiceLang || undefined, emotion: voiceEmotion });
+            }
+            const { url: blobUrl, blob } = recording ? { url: URL.createObjectURL(recording.blob), blob: recording.blob } : await synthesizeSpeechDetailed(spokenText, char, apiConfig, {
                 languageBoost: voiceLang || undefined,
                 groupId: apiConfig.minimaxGroupId || undefined,
                 emotion: voiceEmotion,
@@ -702,25 +755,27 @@ const Chat: React.FC = () => {
             const storedSpokenText = voiceTagContent ? displaySpoken : (voiceLang ? displaySpoken : undefined);
             const storedLang = voiceLang || undefined;
             // Persist so the voice bar survives leaving and re-entering the chat.
-            persistVoice(msg.id, blobUrl, blob, originalText, storedSpokenText, storedLang);
+            persistVoice(msg.id, blobUrl, blob, originalText, storedSpokenText, storedLang, recording);
             if (!voiceMountedRef.current || activeCharIdRef.current !== msg.charId) {
                 if (blobUrl.startsWith('blob:')) URL.revokeObjectURL(blobUrl);
                 return null;
             }
             if (blobUrl.startsWith('blob:')) voiceBlobUrlsRef.current.add(blobUrl);
-            setVoiceDataMap(prev => ({ ...prev, [msg.id]: { url: blobUrl, originalText, spokenText: storedSpokenText, lang: storedLang } }));
+            setVoiceDataMap(prev => ({ ...prev, [msg.id]: { url: blobUrl, originalText, spokenText: storedSpokenText, lang: storedLang, recording } }));
             // 合成完是否立刻播（规则和来由见 shouldAutoPlayGeneratedVoice）：
             // AI 自动发来的默认不响、等用户点；用户自己点着要的一定响。
-            if (shouldAutoPlayGeneratedVoice({ autoTriggered, autoPlayEnabled: char.chatVoiceAutoPlay })) {
+            if (!streamPlayback && shouldAutoPlayGeneratedVoice({ autoTriggered, autoPlayEnabled: char.chatVoiceAutoPlay })) {
                 playChatVoice(msg.id, blobUrl);
             }
             return { url: blobUrl, originalText, spokenText: storedSpokenText, lang: storedLang, blob };
         } catch (err: any) {
             // 记一笔失败：自动那条路下次扫到就跳过（见 voiceFailedRef 的说明）。
+            if (err?.name === 'AbortError') return null;
             voiceFailedRef.current.add(msg.id);
             addToast(`语音生成失败: ${err?.message || '未知错误'}`, 'error');
             return null;
         } finally {
+            if (voiceStreamAborts.current.get(msg.id) === abort) voiceStreamAborts.current.delete(msg.id);
             voiceRequestsRef.current.delete(msg.id);
             setVoiceLoading(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
         }
@@ -735,7 +790,7 @@ const Chat: React.FC = () => {
             if (!blob && stored?.remoteUrl) {
                 try { blob = await fetchBlobForShare(stored.remoteUrl, 'audio/mpeg'); } catch { /* 下面给出明确提示 */ }
             }
-            const fname = `${(char?.name || '语音').replace(/[\\/:*?"<>|]/g, '_')}_语音_${msg.id}.mp3`;
+            const fname = `${(char?.name || '语音').replace(/[\\/:*?"<>|]/g, '_')}_语音_${msg.id}.${blob?.type === 'audio/wav' ? 'wav' : 'mp3'}`;
             if (!blob) {
                 addToast('这条还没有可下载的语音', 'error');
                 return;
@@ -839,6 +894,7 @@ const Chat: React.FC = () => {
         if (!shouldAutoGenerateVoice({ autoPlayEnabled: char.chatVoiceAutoPlay })) return;
         if (!characterHasVoice(char, apiConfig)) return;
         // Scan recent assistant messages for unprocessed <语音> tags
+        const pendingVoices: Message[] = [];
         for (let i = messages.length - 1; i >= 0; i--) {
             const msg = messages[i];
             // Stop scanning once we hit a non-assistant message (end of current AI response batch)
@@ -848,7 +904,16 @@ const Chat: React.FC = () => {
             // 合成失败过就别再自动重试了：扫描窗里每来一条消息都重扫一遍，
             // 同一条会一路重试到窗口关闭，还每次弹一个失败提示。用户手点不受影响。
             if (voiceFailedRef.current.has(msg.id)) continue;
-            handleManualTts(msg, true);
+            pendingVoices.unshift(msg);
+        }
+        for (const msg of pendingVoices) {
+            if (apiConfig.ttsProvider !== 'elevenlabs') { void handleManualTts(msg, true); continue; }
+            if (queuedVoices.current.has(msg.id)) continue;
+            queuedVoices.current.add(msg.id);
+            const epoch = voiceQueueEpoch.current;
+            autoVoiceQueue.current = autoVoiceQueue.current.then(async () => {
+                if (epoch === voiceQueueEpoch.current && voiceMountedRef.current && activeCharIdRef.current === msg.charId) await handleManualTts(msg, true);
+            }).catch(() => {}).finally(() => queuedVoices.current.delete(msg.id));
         }
     }, [isTyping, instantChatPending, messages]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -933,7 +998,7 @@ const Chat: React.FC = () => {
                             DB.saveAssetRaw(voiceAssetKey(m.id), { ...stored, favorite: undefined }).catch(() => undefined);
                         } catch { /* keep the legacy marker and retry next entry */ }
                     }
-                    updates[m.id] = { url, originalText, spokenText: stored.spokenText, lang: stored.lang, favorite: favorited };
+                    updates[m.id] = { url, originalText, spokenText: stored.spokenText, lang: stored.lang, favorite: favorited, recording: stored.recording };
                 } catch { /* ignore single-message hydration errors */ }
             }
             if (cancelled || !Object.keys(updates).length) return;
@@ -981,6 +1046,8 @@ const Chat: React.FC = () => {
         const urls = voiceBlobUrlsRef.current;
         return () => {
             voiceMountedRef.current = false;
+            voiceQueueEpoch.current += 1;
+            voiceStreamAborts.current.forEach(abort => abort.abort()); voiceStreamAborts.current.clear();
             if (chatAudioRef.current) stopVoiceAudio(chatAudioRef.current);
             urls.forEach(u => { try { URL.revokeObjectURL(u); } catch { /* ignore */ } });
             urls.clear();
@@ -1328,7 +1395,7 @@ const Chat: React.FC = () => {
                 // 回合首条即响：距上一条气泡 >3s 视为新回合，立刻响一次；同一轮后续气泡只刷新计时、不再响。
                 const now = Date.now();
                 if (sync.lastAt == null || now - sync.lastAt > SOUND_ROUND_GAP_MS) {
-                    playWhiteboxSound(resolveActiveSound(char?.chromeCustomCss, char?.chatSound, osTheme.chatChromeCustomCss, osTheme.chatSound));
+                    !homePhone && playWhiteboxSound(resolveActiveSound(char?.chromeCustomCss, char?.chatSound, osTheme.chatChromeCustomCss, osTheme.chatSound));
                 }
                 sync.lastAt = now;
             }
@@ -1349,7 +1416,10 @@ const Chat: React.FC = () => {
         noteMessageSent();
         // 借用户"发送"这个手势解锁音频上下文，好让稍后 AI 回复时的白框提示音能顺利播放（移动端自动播放策略）。
         unlockWhiteboxAudio();
-        if (char.chatVoiceEnabled && char.chatVoiceAutoPlay && isTtsReady()) primeVoiceAudio(prepareChatAudio());
+        if (char.chatVoiceEnabled && char.chatVoiceAutoPlay && isTtsReady()) {
+            primeVoiceAudio(prepareChatAudio());
+            if (apiConfig.ttsProvider === 'elevenlabs') streamingVoice.prime();
+        }
         const text = customContent || input.trim();
         const type = customType || 'text';
 
@@ -2692,6 +2762,7 @@ const Chat: React.FC = () => {
             void handleJumpToMessageInChat(messageId);
             return;
         }
+        if(homePhone){addToast('这条收藏来自另一位角色，可在正式聊天里查看原对话','info');return;}
         pendingFavoriteJumpRef.current = { charId, messageId };
         setActiveCharacterId(charId);
     };
@@ -2858,6 +2929,16 @@ const Chat: React.FC = () => {
             setArchiveProgress('');
         }
     };
+
+    useEffect(() => {
+        const refresh=(event:Event)=>{
+            const owner=(event as CustomEvent).detail?.charId;
+            if(!char || owner && owner!==char.id)return;
+            void reloadMessages(visibleCount);
+        };
+        window.addEventListener('home-secrets-updated',refresh);
+        return()=>window.removeEventListener('home-secrets-updated',refresh);
+    },[char?.id,visibleCount,reloadMessages]);
 
     // --- Message Management ---
     const handleDeleteMessage = async () => {
@@ -3455,7 +3536,7 @@ const Chat: React.FC = () => {
     const autoReply = useChatAutoReply({
         enabled: inputPreferences.autoReply,
         conversationId: activeCharacterId || null,
-        active: activeApp === AppID.Chat && !!char,
+        active: (activeApp === AppID.Chat || !!homePhone) && !!char,
         blocked: isInputFocused || !!input.trim() || showPanel !== 'none' || modalType !== 'none'
             || selectionMode || isSummarizing || collaborationOpen || memoryRepairOpen || favoritesOpen
             || showProactiveModal || showActiveMsg2Modal || showThinkingChainModal
@@ -3466,7 +3547,7 @@ const Chat: React.FC = () => {
     // 角色自定义聊天背景：字段值可能是 blobref 令牌（二进制在 IndexedDB），这里解析成能直接
     // 喂进 CSS url() 的地址；data: / http(s) 之类的非令牌值渲染期原样透传。
     // hook 必须在下面的空态早退之前调用，所以用可选链读 char。
-    const resolvedChatBackground = useBlobRefUrl(char?.chatBackground ?? osTheme.chatBackground);
+    const resolvedChatBackground = useBlobRefUrl(homePhone?undefined:char?.chatBackground ?? osTheme.chatBackground);
     // 兜底：正常情况下 OSContext 启动时一定会保底一个角色，char 不该为空。
     // 但若 init 期间某个 store 读取失败（数据其实还在 IndexedDB 里），characters 可能暂时为空，
     // 此时下面读 char 上的字段会直接抛 "undefined is not an object" 把整个 App 崩到错误页。
@@ -3536,7 +3617,7 @@ const Chat: React.FC = () => {
     const finalRootStyle = acnh ? acnhRootStyle : chatRootStyle;
     // 聊天细节微调（外观 → 聊天细节，全局打底；角色开了「聊天装扮」时逐字段覆盖）：
     // CSS 全默认时为空串不注入；chatModuleAlign 不走 CSS，作为布局属性传给 MessageItem。
-    const mergedFineTune = useMemo(() => mergeChatFineTune(osTheme, char?.chatFineTune), [osTheme, char?.chatFineTune]);
+    const mergedFineTune = useMemo(() => mergeChatFineTune(osTheme, homePhone?undefined:char?.chatFineTune), [osTheme, char?.chatFineTune,!!homePhone]);
     const chatFineTuneCss = useMemo(() => buildChatFineTuneCss(mergedFineTune), [mergedFineTune]);
     const chatAvatarSizeClass = osTheme.chatAvatarSize === 'small' ? 'w-7 h-7' : osTheme.chatAvatarSize === 'large' ? 'w-12 h-12' : 'w-9 h-9';
     const chatAvatarRadiusClass = osTheme.chatAvatarShape === 'square' ? 'rounded-sm' : osTheme.chatAvatarShape === 'rounded' ? 'rounded-xl' : 'rounded-full';
@@ -3547,16 +3628,17 @@ const Chat: React.FC = () => {
             className={`sully-chat-root ${finalRootClass}`}
             style={finalRootStyle}
         >
+             <ChatRuntimeStyle />
              {/* 聊天细节微调（外观 App 可视化设置生成）：排在用户自定义 CSS 之前——
                  同为 !important 时后写的胜，手写美化代码永远可覆盖可视化设置。 */}
              {chatFineTuneCss && <style>{chatFineTuneCss}</style>}
-             {char.chatAppearance?.chatEmojiSize && char.chatFineTune?.enabled !== false && <style>{`.sully-chat-root { --sully-emoji-size: ${{small:96,medium:128,large:160}[osTheme.chatEmojiSize || 'small']}px; }`}</style>}
+             {!homePhone && char.chatAppearance?.chatEmojiSize && char.chatFineTune?.enabled !== false && <style>{`.sully-chat-root { --sully-emoji-size: ${{small:96,medium:128,large:160}[osTheme.chatEmojiSize || 'small']}px; }`}</style>}
              {/* 白框自定义 CSS：全局默认在前、角色专属在后（后者叠加覆盖）。作用于 .sully-chat-* 各零件。
                  守护样式统一放在气泡主题 customCss 之后（见下），保证对所有用户 CSS 都能兜底。 */}
              {/* 心象卡片自定义 CSS（per-character）：作用于 .sully-psyche-* 各零件，编辑入口在个性装扮 / 聊天装扮的心象分栏 */}
-             {resolvePsycheAppearance(osTheme, char).customCss && <style>{resolvePsycheAppearance(osTheme, char).customCss}</style>}
+             {!homePhone && resolvePsycheAppearance(osTheme, char).customCss && <style>{resolvePsycheAppearance(osTheme, char).customCss}</style>}
              {osTheme.chatChromeCustomCss && <BlobRefStyle css={osTheme.chatChromeCustomCss}/>}
-             {char.chromeCustomCss && <BlobRefStyle css={char.chromeCustomCss}/>}
+             {!homePhone && char.chromeCustomCss && <BlobRefStyle css={char.chromeCustomCss}/>}
              {scheduleChangeNotice && (
                <ScheduleChangeNotice
                  key={scheduleChangeNotice.eventId}
@@ -3565,7 +3647,7 @@ const Chat: React.FC = () => {
                />
              )}
              {/* 角色「登场」过场：切换/进入时以 ta 的头像氛围铺底登场，再推进穿过进入聊天。key 切换即重放；同层弹窗必须使用不同前缀，避免残留过场遮罩。 */}
-             {showEntry && char && (
+             {!homePhone && showEntry && char && (
                <CharacterEntryTransition
                  key={`character-entry:${activeCharacterId}`}
                  name={char.name}
@@ -3588,7 +3670,7 @@ const Chat: React.FC = () => {
                  pointer-events:none 时，用户会遇到「点输入框没反应、键盘唤不起来」或退不出聊天，
                  且重启、重新导入备份都无解。有了兜底，至少能退出去「外观→聊天界面→还原白框」清掉坏 CSS。
                  不锁位置与配色，正常美化不受影响。 */}
-             {(osTheme.chatChromeCustomCss || char.chromeCustomCss || activeTheme.customCss || (char as any).thinkingChainCustomCss) && (
+             {!homePhone && (osTheme.chatChromeCustomCss || char.chromeCustomCss || activeTheme.customCss || (char as any).thinkingChainCustomCss) && (
                <style>{`
                  .sully-chat-back{visibility:visible!important;opacity:1!important;pointer-events:auto!important;}
                  .sully-chat-inputbar{visibility:visible!important;opacity:1!important;pointer-events:auto!important;}
@@ -3770,6 +3852,7 @@ const Chat: React.FC = () => {
                 confirmText="关闭，发送原文" cancelText="保留卡片"
                 onConfirm={() => answerLinkCard(false)} onCancel={() => answerLinkCard(true)} />
             <ChatModals
+                compactHome={!!homePhone}
                 modalType={modalType} setModalType={setModalType}
                 transferAmt={transferAmt} setTransferAmt={setTransferAmt}
                 transferNote={transferNote} setTransferNote={setTransferNote}
@@ -3894,7 +3977,7 @@ const Chat: React.FC = () => {
                 document.body,
              )}
 
-             <ChatHeader
+             {homePhone?<header className="home-phone-chat-header"><span className="home-phone-chat-avatar" aria-hidden="true">{char.name.slice(0,1)}</span><div><strong>{chatCharacterDisplayName(char)}</strong><small>{isTyping||instantChatPending?'正在输入…':'在家，也想给你发消息'}</small></div><button onClick={handleManualTrigger} disabled={isTyping} aria-label="让对方回复">↗</button></header>:<ChatHeader
                 selectionMode={selectionMode}
                 selectedCount={selectedMsgIds.size + Array.from(selectedThinkingMsgIds).filter(id => !selectedMsgIds.has(id)).length}
                 onCancelSelection={() => { setSelectionMode(false); setSelectedMsgIds(new Set()); setSelectedThinkingMsgIds(new Set()); }}
@@ -3926,7 +4009,7 @@ const Chat: React.FC = () => {
                 chromeStyle={osTheme.chatChromeStyle}
                 hideBuffs={osTheme.chatHideHeaderBuffs}
                 acnh={acnh}
-             />
+             />}
 
             {/* 认知消化结果弹窗 — 全屏玻璃拟态 */}
             {lastDigestResult && (() => {
@@ -4048,6 +4131,7 @@ const Chat: React.FC = () => {
                 );
             })()}
 
+            <StreamingVoiceBar state={streamingVoice.state} onStop={stopStreamingVoice} />
             <div ref={scrollRef} onScroll={handleChatScroll} onClick={() => { if (inputPreferences.autoReply) setShowPanel('none'); }} className="flex-1 overflow-y-auto overflow-x-hidden pt-6 pb-6 no-scrollbar" style={{ backgroundImage: activeTheme.type === 'custom' && activeTheme.user.backgroundImage ? 'none' : undefined }}>
                 {windowedFocusMsgId !== null && (
                     <div className="sticky top-0 z-20 flex justify-center pb-2 pointer-events-none">
@@ -4325,6 +4409,7 @@ const Chat: React.FC = () => {
                 <InstantChatRouteNotice charId={activeCharacterId} />
 
                 <ChatInputArea
+                    compactHome={!!homePhone}
                     input={input} setInput={handleInputChange}
                     isTyping={isTyping || instantChatPending} selectionMode={selectionMode}
                     showPanel={showPanel} setShowPanel={setShowPanel}
@@ -4467,6 +4552,7 @@ const Chat: React.FC = () => {
             {/* 🍔 麦当劳小程序 - MCP 数据流按钮驱动, 协同聊天走主 pipeline (完整人设/记忆/日程) */}
             {memoryRepairOpen && char && (
                 <MemoryRepairPortal
+                    inline={!!homePhone}
                     char={char}
                     user={userProfile}
                     apiConfig={apiConfig}
@@ -4484,6 +4570,7 @@ const Chat: React.FC = () => {
 
             {favoritesOpen && (
                 <FavoritesPortal
+                    inline={!!homePhone}
                     onClose={() => setFavoritesOpen(false)}
                     onJumpToMessage={handleOpenFavoriteMessage}
                 />
