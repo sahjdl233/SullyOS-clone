@@ -36,8 +36,15 @@ export default function DialogueApiFields({ value, onChange, fetchModels, isLoad
                     {showApiAdvanced && (
                         <div className="mt-2 pl-2 border-l-2 border-slate-100 space-y-3 py-2">
                             <p className="text-[10px] text-slate-300 leading-relaxed">
-                                这两项绝大多数用户保持默认即可。除非接口报错"only stream supported"或对回复风格有强需求，否则不建议改。
+                                通常保持默认即可；如接口有输出额度或流式要求，可按服务商说明调整。
                             </p>
+                            <label className="block text-[10px] text-slate-400">
+                                私聊最大生成 Token（max_tokens）
+                                <input type="number" min={1} step={1} value={value.maxTokens ?? ''} placeholder="跟随全局，默认 8000"
+                                    onChange={e => { const n = Number(e.target.value); if (!e.target.value || (Number.isSafeInteger(n) && n > 0)) onChange({ maxTokens: e.target.value ? n : undefined }); }}
+                                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm" />
+                                <span className="block mt-1 text-[9px] leading-relaxed">限制一次回复的输出量，不是历史消息条数。较小值可减少预留额度，过小可能截断回复；历史输入超限仍需调整上下文或归档。需在模型支持范围内填写。</span>
+                            </label>
                             <div className="flex items-center justify-between">
                                 <div>
                                     <span className="text-[10px] text-slate-400">流式输出 (Stream)</span>
@@ -74,19 +81,19 @@ export default function DialogueApiFields({ value, onChange, fetchModels, isLoad
                 <div className="pt-2">
                      <div className="flex justify-between items-center mb-1.5 pl-1">
                         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Model</label>
-                        <button onClick={fetchModels} disabled={isLoadingModels} className="text-[10px] text-primary font-bold">{isLoadingModels ? 'Fetching...' : '刷新模型列表'}</button>
+                        <button onClick={fetchModels} disabled={isLoadingModels} className="text-[10px] text-primary font-bold">{isLoadingModels ? '正在拉取…' : '刷新模型列表'}</button>
                     </div>
                     
                     <button
                         onClick={openModelPicker}
-                        title={localModel || 'Select Model...'}
+                        title={localModel || '选择模型…'}
                         className="w-full bg-white/50 border border-slate-200/60 rounded-xl px-4 py-3 text-sm text-slate-700 flex justify-between items-center gap-2 active:bg-white transition-all shadow-sm"
                     >
                         <span
                             className="font-mono overflow-hidden whitespace-nowrap min-w-0 flex-1 text-left"
                             style={{ direction: 'rtl', textOverflow: 'ellipsis' }}
                         >
-                            <bdi style={{ direction: 'ltr' }}>{localModel || 'Select Model...'}</bdi>
+                            <bdi style={{ direction: 'ltr' }}>{localModel || '选择模型…'}</bdi>
                         </span>
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-slate-400 flex-shrink-0"><path fillRule="evenodd" d="M5.22 8.22a.75.75 0 0 1 1.06 0L10 11.94l3.72-3.72a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L5.22 9.28a.75.75 0 0 1 0-1.06Z" clipRule="evenodd" /></svg>
                     </button>
