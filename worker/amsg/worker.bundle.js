@@ -2,7 +2,7 @@
 
 // worker/amsg/src/instantInput.ts
 var INSTANT_INPUT_NAMESPACE = "amsg:instant-input";
-var INSTANT_INPUT_TTL_DAYS = 30;
+var INSTANT_INPUT_TTL_DAYS = 7;
 var parseInstantInputRef = (value) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const ref = value;
@@ -16,6 +16,326 @@ var parseInstantInputEnvelope = (value) => {
     return null;
   }
 };
+
+// utils/llmEndpoint.ts
+function isAnthropicEndpoint(value) {
+  try {
+    return /\/messages(?:\/(?:chat\/completions|models))?\/?$/.test(new URL(value).pathname);
+  } catch {
+    return false;
+  }
+}
+function nativeRequestUrl(value) {
+  const url = new URL(value);
+  url.pathname = url.pathname.replace(/\/messages\/chat\/completions\/?$/, "/messages").replace(/\/messages\/models\/?$/, "/models");
+  return url.href;
+}
+
+// utils/samplingParamCompat.ts
+function modelRejectsSamplingParams(model) {
+  if (typeof model !== "string" || !model) return false;
+  const m = model.toLowerCase();
+  if (/opus[-.\s]?4[-.\s]?(7|8|9)\b/.test(m)) return true;
+  if (/opus[-.\s]?(?:[5-9]|\d\d)\b/.test(m)) return true;
+  if (/sonnet[-.\s]?(?:[5-9]|\d\d)\b/.test(m)) return true;
+  if (/\b(?:fable|mythos)[-.\s]?\d/.test(m)) return true;
+  if (/\bgpt-?5/.test(m)) return true;
+  return false;
+}
+
+// utils/anthropicApi.ts
+var ephemeral = { type: "ephemeral" };
+var finishReason = (reason) => reason === "tool_use" ? "tool_calls" : reason === "max_tokens" ? "length" : "stop";
+function contentBlocks(content) {
+  if (content == null || content === "") return [];
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (!Array.isArray(content)) throw Error("Anthropic \u6D88\u606F\u5185\u5BB9\u5FC5\u987B\u4E3A\u6587\u672C\u6216\u5185\u5BB9\u5757");
+  return content.flatMap((part) => {
+    if (part.type === "text") return part.text ? [{ type: "text", text: part.text }] : [];
+    if (part.type === "image_url") {
+      const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+      const data = typeof url === "string" && url.match(/^data:(image\/(?:jpeg|png|gif|webp));base64,([\s\S]+)$/i);
+      if (data) return [{ type: "image", source: { type: "base64", media_type: data[1].toLowerCase(), data: data[2] } }];
+      if (typeof url === "string" && /^https?:\/\//i.test(url)) return [{ type: "image", source: { type: "url", url } }];
+      throw Error("Anthropic \u56FE\u7247\u9700\u4E3A HTTP \u5730\u5740\u6216\u53D7\u652F\u6301\u7684 base64 \u56FE\u7247");
+    }
+    if (["image", "document", "tool_result", "tool_use", "thinking", "redacted_thinking"].includes(part.type)) return [structuredClone(part)];
+    throw Error(`Anthropic \u6682\u4E0D\u652F\u6301\u5185\u5BB9\u5757\uFF1A${String(part.type)}`);
+  });
+}
+function toAnthropicRequest(body) {
+  if (!Array.isArray(body.messages)) throw Error("Anthropic \u8BF7\u6C42\u7F3A\u5C11 messages");
+  const system = [];
+  const messages = [];
+  let lastHistoryBlock;
+  let sawReminder = false;
+  const append = (role, blocks) => {
+    if (!blocks.length) return;
+    const previous = messages.at(-1);
+    if (previous?.role === role) previous.content.push(...blocks);
+    else messages.push({ role, content: blocks });
+  };
+  for (const message of body.messages) {
+    if (message.role === "system" || message.role === "developer") {
+      const blocks2 = contentBlocks(message.content);
+      if (!messages.length) system.push(...blocks2);
+      else {
+        sawReminder = true;
+        append("user", [{ type: "text", text: "<system-reminder>\n" + blocks2.map((block) => block.text || "").join("\n") + "\n</system-reminder>" }]);
+      }
+      continue;
+    }
+    let blocks;
+    if (message.role === "tool") {
+      if (!message.tool_call_id) throw Error("Anthropic \u5DE5\u5177\u7ED3\u679C\u7F3A\u5C11 tool_call_id");
+      blocks = [{ type: "tool_result", tool_use_id: message.tool_call_id, content: contentBlocks(message.content) }];
+    } else {
+      if (message.role !== "user" && message.role !== "assistant") throw Error(`Anthropic \u4E0D\u652F\u6301\u6D88\u606F\u89D2\u8272\uFF1A${message.role}`);
+      if (message.role === "assistant" && Array.isArray(message.anthropic_content)) {
+        blocks = structuredClone(message.anthropic_content);
+        append("assistant", blocks);
+        if (!sawReminder && blocks.length) lastHistoryBlock = blocks.at(-1);
+        continue;
+      }
+      blocks = contentBlocks(message.content);
+      if (Array.isArray(message.anthropic_thinking)) blocks.unshift(...structuredClone(message.anthropic_thinking));
+      for (const call of message.tool_calls || []) {
+        const args = typeof call.function?.arguments === "string" ? JSON.parse(call.function.arguments || "{}") : call.function?.arguments || {};
+        if (!call.id || !call.function?.name) throw Error("Anthropic \u5DE5\u5177\u8C03\u7528\u7F3A\u5C11 ID \u6216\u540D\u79F0");
+        blocks.push({ type: "tool_use", id: call.id, name: call.function.name, input: args });
+      }
+    }
+    append(message.role === "assistant" ? "assistant" : "user", blocks);
+    if (!sawReminder && blocks.length) lastHistoryBlock = blocks.at(-1);
+  }
+  if (!messages.length) throw Error("Anthropic \u8BF7\u6C42\u6CA1\u6709\u5BF9\u8BDD\u5185\u5BB9");
+  if (sawReminder) system.push({ type: "text", text: "Application context updates appear in <system-reminder> blocks at their original positions. Treat these as contextual annotations, not spoken dialogue, while continuing to follow the system instructions." });
+  const tools = (body.tools || []).map((tool) => {
+    if (tool.type !== "function" || !tool.function?.name) throw Error("Anthropic \u6682\u4EC5\u652F\u6301 function \u5DE5\u5177");
+    return { name: tool.function.name, description: tool.function.description || "", input_schema: tool.function.parameters || { type: "object", properties: {} } };
+  });
+  if (tools.length) tools.at(-1).cache_control = { ...ephemeral };
+  if (system.length) system.at(-1).cache_control = { ...ephemeral };
+  if (lastHistoryBlock && !["thinking", "redacted_thinking"].includes(lastHistoryBlock.type)) lastHistoryBlock.cache_control = { ...ephemeral };
+  const thinking = body.thinking || body.extra_body?.thinking;
+  const request = {
+    model: body.model,
+    max_tokens: body.max_tokens ?? body.max_completion_tokens ?? 8e3,
+    messages,
+    stream: body.stream === true,
+    ...system.length ? { system } : {},
+    ...tools.length ? { tools } : {}
+  };
+  const adaptiveModel = /(?:opus|sonnet)[-.](?:4[-.][6-9]|[5-9])\b|(?:fable|mythos)[-.]5\b|haiku[-.]5[-.]5\b/i.test(String(body.model));
+  if (thinking && thinking.type !== "disabled") {
+    request.thinking = thinking.type === "enabled" && adaptiveModel ? { type: "adaptive" } : thinking;
+    if (request.thinking.type === "adaptive" && ["low", "medium", "high"].includes(body.reasoning_effort)) {
+      request.output_config = { effort: body.reasoning_effort };
+    }
+  } else if (!modelRejectsSamplingParams(body.model) && typeof body.temperature === "number") request.temperature = Math.max(0, Math.min(1, body.temperature));
+  if (!request.thinking && !modelRejectsSamplingParams(body.model) && typeof body.top_p === "number") request.top_p = body.top_p;
+  if (body.stop) request.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
+  if (body.tool_choice && tools.length) {
+    request.tool_choice = typeof body.tool_choice === "string" ? { type: body.tool_choice === "required" ? "any" : body.tool_choice } : { type: "tool", name: body.tool_choice.function?.name };
+  }
+  if (tools.length && body.parallel_tool_calls === false) {
+    request.tool_choice = { ...request.tool_choice || { type: "auto" }, disable_parallel_tool_use: true };
+  }
+  if (body.response_format?.type === "json_object") {
+    request.system = [...system, { type: "text", text: "Return a valid JSON value only, without Markdown fences." }];
+  } else if (body.response_format?.type === "json_schema") {
+    request.output_config = { ...request.output_config, format: { type: "json_schema", schema: body.response_format.json_schema?.schema } };
+  }
+  return request;
+}
+function anthropicUsage(usage = {}) {
+  const input = usage.input_tokens || 0, read = usage.cache_read_input_tokens || 0, write = usage.cache_creation_input_tokens || 0;
+  return { ...usage, prompt_tokens: input + read + write, completion_tokens: usage.output_tokens || 0, total_tokens: input + read + write + (usage.output_tokens || 0), prompt_tokens_details: { cached_tokens: read }, cache_creation_input_tokens: write };
+}
+function fromAnthropicMessage(message) {
+  if (message.type === "error") throw Error(message.error?.message || "Anthropic \u8FD4\u56DE\u9519\u8BEF");
+  if (message.type !== "message" || !Array.isArray(message.content)) throw Error("Anthropic \u8FD4\u56DE\u4E86\u65E0\u6548 Messages \u54CD\u5E94");
+  const text2 = message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  const thinking = message.content.filter((b) => b.type === "thinking" || b.type === "redacted_thinking");
+  const calls = message.content.filter((b) => b.type === "tool_use").map((b) => ({ id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input) } }));
+  return { id: message.id, object: "chat.completion", model: message.model, choices: [{ index: 0, finish_reason: finishReason(message.stop_reason), message: {
+    role: "assistant",
+    content: text2,
+    ...thinking.length ? { reasoning_content: thinking.map((b) => b.thinking || "").join(""), anthropic_thinking: thinking } : {},
+    ...thinking.length || calls.length ? { anthropic_content: message.content } : {},
+    ...calls.length ? { tool_calls: calls } : {}
+  } }], usage: anthropicUsage(message.usage) };
+}
+function convertAnthropicStream(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder(), encoder2 = new TextEncoder();
+  let pending = "", eventData = [], stopped = false, id = "", model = "", usage = {}, emitted = 0;
+  const toolIndices = /* @__PURE__ */ new Map();
+  const thinking = /* @__PURE__ */ new Map();
+  const blocks = /* @__PURE__ */ new Map(), toolJson = /* @__PURE__ */ new Map();
+  const emitEvent = (controller) => {
+    if (stopped) {
+      eventData = [];
+      return;
+    }
+    if (!eventData.length) return;
+    const event = JSON.parse(eventData.join("\n"));
+    eventData = [];
+    if (event.type === "error") throw Error(event.error?.message || "Anthropic \u6D41\u5F0F\u9519\u8BEF");
+    let delta = {}, end = null;
+    if (event.type === "message_start") {
+      id = event.message.id;
+      model = event.message.model;
+      usage = { ...event.message.usage };
+      delta.role = "assistant";
+    } else if (event.type === "content_block_start") {
+      const block = structuredClone(event.content_block);
+      blocks.set(event.index, block);
+      if (block.type === "tool_use") {
+        const index = toolIndices.size;
+        toolIndices.set(event.index, index);
+        delta.tool_calls = [{ index, id: block.id, type: "function", function: { name: block.name, arguments: Object.keys(block.input || {}).length ? JSON.stringify(block.input) : "" } }];
+      } else if (block.type === "text") delta.content = block.text || "";
+      else if (block.type === "thinking" || block.type === "redacted_thinking") {
+        thinking.set(event.index, block);
+        delta.reasoning_content = block.thinking || "";
+      }
+    } else if (event.type === "content_block_delta") {
+      if (event.delta.type === "text_delta") delta.content = event.delta.text;
+      if (event.delta.type === "text_delta" && blocks.has(event.index)) blocks.get(event.index).text += event.delta.text;
+      if (event.delta.type === "input_json_delta") toolJson.set(event.index, (toolJson.get(event.index) || "") + event.delta.partial_json);
+      if (event.delta.type === "input_json_delta") {
+        const index = toolIndices.get(event.index);
+        if (index === void 0) throw Error("Anthropic \u5DE5\u5177\u6D41\u7F3A\u5C11\u8D77\u59CB\u4E8B\u4EF6");
+        delta.tool_calls = [{ index, function: { arguments: event.delta.partial_json } }];
+      }
+      if (event.delta.type === "thinking_delta") {
+        delta.reasoning_content = event.delta.thinking;
+        const block = thinking.get(event.index);
+        if (block) block.thinking = (block.thinking || "") + event.delta.thinking;
+      }
+      if (event.delta.type === "signature_delta") {
+        const block = thinking.get(event.index);
+        if (block) block.signature = (block.signature || "") + event.delta.signature;
+      }
+    } else if (event.type === "message_delta") {
+      usage = { ...usage, ...event.usage };
+    } else if (event.type === "message_stop") {
+      stopped = true;
+      end = "stop";
+    }
+    if (event.delta?.stop_reason) usage.__stop_reason = event.delta.stop_reason;
+    if (stopped) {
+      end = finishReason(usage.__stop_reason);
+      for (const [index, json] of toolJson) blocks.get(index).input = JSON.parse(json || "{}");
+      if (thinking.size) delta.anthropic_thinking = [...thinking.values()];
+      if (thinking.size || toolIndices.size) delta.anthropic_content = [...blocks.values()];
+    }
+    if (Object.keys(delta).length || stopped || event.type === "message_delta") {
+      emitted++;
+      const { __stop_reason, ...reportedUsage } = usage;
+      controller.enqueue(encoder2.encode(`data: ${JSON.stringify({ id, model, object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: end }], usage: anthropicUsage(reportedUsage) })}
+
+`));
+    }
+    if (stopped) controller.enqueue(encoder2.encode("data: [DONE]\n\n"));
+  };
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const before = emitted;
+        while (true) {
+          const result = await reader.read();
+          pending += decoder.decode(result.value, { stream: !result.done });
+          let newline;
+          while ((newline = pending.indexOf("\n")) >= 0) {
+            const line = pending.slice(0, newline).replace(/\r$/, "");
+            pending = pending.slice(newline + 1);
+            if (!line) emitEvent(controller);
+            else if (line.startsWith("data:")) eventData.push(line.slice(5).trimStart());
+          }
+          if (result.done) {
+            if (pending.startsWith("data:")) eventData.push(pending.slice(5).trimStart());
+            emitEvent(controller);
+            if (!stopped) throw Error("Anthropic \u6D41\u5F0F\u8FDE\u63A5\u63D0\u524D\u7ED3\u675F\uFF0C\u672A\u6536\u5230 message_stop");
+            controller.close();
+            reader.releaseLock();
+            return;
+          }
+          if (stopped) {
+            controller.close();
+            await reader.cancel();
+            return;
+          }
+          if (emitted > before) return;
+        }
+      } catch (error) {
+        controller.error(error);
+        await reader.cancel().catch(() => {
+        });
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason);
+    }
+  });
+  return new Response(stream, { status: response.status, statusText: response.statusText, headers: { "content-type": "text/event-stream", "x-request-id": response.headers.get("request-id") || "" } });
+}
+async function fetchLlm(resource, init, transport = globalThis.fetch, browser = typeof window !== "undefined") {
+  if (transport.__sullyAnthropic) return transport(resource, init);
+  const inputUrl = typeof resource === "string" ? resource : resource instanceof URL ? resource.href : resource.url;
+  if (!isAnthropicEndpoint(inputUrl)) return transport(resource, init);
+  const request = resource instanceof Request ? resource : void 0;
+  const method = (init?.method || request?.method || "GET").toUpperCase();
+  const body = init?.body ?? (request && method === "POST" ? await request.clone().text() : void 0);
+  let parsed;
+  if (method === "POST") {
+    try {
+      parsed = typeof body === "string" ? JSON.parse(body) : void 0;
+    } catch {
+    }
+    if (typeof parsed?.model !== "string" || !Array.isArray(parsed.messages)) return transport(resource, init);
+  } else if (method !== "GET" || !/\/messages\/models\/?$/.test(new URL(inputUrl).pathname)) return transport(resource, init);
+  const headers = new Headers(init?.headers || request?.headers);
+  const key = headers.get("x-api-key") || headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+  headers.delete("authorization");
+  headers.set("x-api-key", key);
+  headers.set("anthropic-version", "2023-06-01");
+  if (browser) headers.set("anthropic-dangerous-direct-browser-access", "true");
+  const url = nativeRequestUrl(inputUrl);
+  const inherited = request ? { cache: request.cache, credentials: request.credentials, integrity: request.integrity, keepalive: request.keepalive, mode: request.mode, redirect: request.redirect, referrer: request.referrer, referrerPolicy: request.referrerPolicy } : {};
+  const options = { ...inherited, ...init, method, headers, signal: init?.signal || request?.signal };
+  if (method === "POST") {
+    if (typeof body !== "string") throw Error("Anthropic \u8BF7\u6C42\u5FC5\u987B\u4E3A JSON");
+    options.body = JSON.stringify(toAnthropicRequest(parsed));
+    headers.set("content-type", "application/json");
+    headers.delete("content-length");
+  }
+  const response = await transport(url, options);
+  if (!response.ok || method !== "POST") return response;
+  if (response.headers.get("content-type")?.includes("text/event-stream")) {
+    if (!response.body) throw Error("Anthropic \u8FD4\u56DE\u4E86\u7A7A\u6D41");
+    return convertAnthropicStream(response);
+  }
+  return new Response(JSON.stringify(fromAnthropicMessage(await response.json())), { status: response.status, statusText: response.statusText, headers: { "content-type": "application/json" } });
+}
+function installAnthropicFetch(browser = false) {
+  if (globalThis.fetch.__sullyAnthropic) return;
+  const original = globalThis.fetch.bind(globalThis);
+  const wrapped = (resource, init) => fetchLlm(resource, init, original, browser);
+  wrapped.__sullyAnthropic = true;
+  globalThis.fetch = wrapped;
+}
+
+// utils/characterWeather.ts
+function cleanCharacterWeatherCities(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([id, city]) => id && typeof city === "string" && city.trim()).map(([id, city]) => [id, city.trim().slice(0, 100)]));
+}
+function weatherForCharacter(config, charId) {
+  const city = charId && Object.hasOwn(config.weatherCities || {}, charId) ? config.weatherCities?.[charId] : void 0;
+  return typeof city === "string" && city.trim() ? { ...config, weatherCity: city.trim().slice(0, 100) } : config;
+}
 
 // utils/proxyWorker.ts
 var DEFAULT_PROXY_WORKER = "https://proxy.friedsully.com";
@@ -81,6 +401,7 @@ var parseToolConfig = (value) => {
     } else {
       delete parsed.mcpServers;
     }
+    if (parsed.weatherCities !== void 0) parsed.weatherCities = cleanCharacterWeatherCities(parsed.weatherCities);
     return parsed;
   } catch {
     return null;
@@ -1112,29 +1433,66 @@ async function resolveSullyCloudOwnership(input) {
 }
 
 // utils/amsgStoppedReply.ts
-var stoppedReplyKey = (uuid) => `chat_stop:${uuid}`;
+var STOPPED_REPLY_KEY_PREFIX = "chat_stop:";
+var stoppedReplyKey = (uuid) => `${STOPPED_REPLY_KEY_PREFIX}${uuid}`;
+var MAX_CLOUD_STOPPED_REPLY_KEYS = 8;
+var STOPPED_REPLY_CLOUD_TTL_MS = 24 * 60 * 60 * 1e3;
 function reconcileStoppedReplies(log, rows) {
   if (!log) return log;
   const kept = /* @__PURE__ */ new Map();
   for (const row of rows) {
-    if (!row.key.startsWith("chat_stop:")) continue;
+    if (!row.key.startsWith(STOPPED_REPLY_KEY_PREFIX)) continue;
     try {
       const value = JSON.parse(row.value);
-      if (typeof value.text === "string") kept.set(row.key.slice("chat_stop:".length), value.text);
+      if (typeof value.text === "string") kept.set(row.key.slice(STOPPED_REPLY_KEY_PREFIX.length), value.text);
     } catch {
     }
   }
-  return { ...log, entries: log.entries.flatMap((entry) => {
+  if (kept.size === 0) return log;
+  let changed = false;
+  const entries = log.entries.flatMap((entry) => {
     if (!entry.taskUuid || !kept.has(entry.taskUuid)) return [entry];
     const text2 = kept.get(entry.taskUuid);
-    return text2 ? [{ ...entry, text: text2 }] : [];
-  }) };
+    if (!text2) {
+      changed = true;
+      return [];
+    }
+    if (text2 !== entry.text) changed = true;
+    return [{ ...entry, text: text2 }];
+  });
+  return changed ? { ...log, entries } : log;
+}
+function pickStaleStoppedReplyKeys(rows, nowMs = Date.now(), protectKey) {
+  const stopRows = rows.map((row, index) => ({ key: row.key, updatedAt: row.updatedAt, index })).filter((row) => row.key.startsWith(STOPPED_REPLY_KEY_PREFIX) && row.key !== protectKey);
+  if (stopRows.length === 0) return [];
+  const cutoff = nowMs - STOPPED_REPLY_CLOUD_TTL_MS;
+  const stale = /* @__PURE__ */ new Set();
+  const fresh = [];
+  for (const row of stopRows) {
+    if (typeof row.updatedAt === "number" && row.updatedAt > 0 && row.updatedAt < cutoff) {
+      stale.add(row.key);
+    } else {
+      fresh.push(row);
+    }
+  }
+  if (fresh.length > MAX_CLOUD_STOPPED_REPLY_KEYS) {
+    fresh.sort((a, b) => {
+      const ta = typeof a.updatedAt === "number" ? a.updatedAt : 0;
+      const tb = typeof b.updatedAt === "number" ? b.updatedAt : 0;
+      return ta !== tb ? ta - tb : a.index - b.index;
+    });
+    const overflow = fresh.length - MAX_CLOUD_STOPPED_REPLY_KEYS;
+    for (let i = 0; i < overflow; i += 1) {
+      stale.add(fresh[i].key);
+    }
+  }
+  return [...stale];
 }
 
 // worker/amsg/src/index.ts
 import { DurableObject } from "cloudflare:workers";
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-server@3.1.0-next.1_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-GN44PST5.mjs
+// node_modules/.pnpm/@rei-standard+amsg-server@3.1.0_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-GN44PST5.mjs
 var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
   "user_id",
   "uuid",
@@ -1153,7 +1511,7 @@ var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
 var TASK_DELIVERY_COLUMNS = "id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count";
 var TASK_DETAIL_COLUMNS = "id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at";
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-shared@0.4.0/node_modules/@rei-standard/amsg-shared/dist/index.mjs
+// node_modules/.pnpm/@rei-standard+amsg-shared@0.4.0/node_modules/@rei-standard/amsg-shared/dist/index.mjs
 var TEXT_ENCODER = new TextEncoder();
 var TEXT_DECODER = new TextDecoder("utf-8", { fatal: false });
 function toUint8(buf) {
@@ -2346,7 +2704,7 @@ function stringifyDecisionForError(value) {
   }
 }
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-server@3.1.0-next.1_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-EIM3PKFY.mjs
+// node_modules/.pnpm/@rei-standard+amsg-server@3.1.0_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-A4LPROFY.mjs
 var DAY_MS = 24 * 60 * 60 * 1e3;
 var MAX_LISTED_SKIPPED_OCCURRENCES = 32;
 var MAX_ADJUST_STEPS = 32;
@@ -3201,6 +3559,11 @@ function sanitizeErrorSummary(reason) {
   const safe = redactCredentials(flattened);
   return safe.length > ERROR_SUMMARY_MAX_CHARS ? `${safe.slice(0, ERROR_SUMMARY_MAX_CHARS - 3)}\u2026` : safe;
 }
+var D1_LIMIT_CODES = [
+  [/Exceeded maximum DB size/i, "D1_STORAGE_FULL"],
+  [/daily row read limit/i, "D1_DAILY_READ_LIMIT"],
+  [/daily row write limit/i, "D1_DAILY_WRITE_LIMIT"]
+];
 function summarizeErrorCause(error, stage) {
   const raw = error && typeof error === "object" ? (
     /** @type {any} */
@@ -3215,6 +3578,9 @@ function summarizeErrorCause(error, stage) {
   };
   if (typeof raw.code === "string" && raw.code) {
     cause.code = sanitizeErrorSummary(raw.code).slice(0, 100);
+  } else {
+    const limit = D1_LIMIT_CODES.find(([pattern]) => pattern.test(rawMessage));
+    if (limit) cause.code = limit[1];
   }
   return cause;
 }
@@ -5948,9 +6314,19 @@ async function deriveSerializeGroup(userKey, rawKey) {
   return bytesToBase64Url(await hmacSha256(utf8(userKey), utf8(rawKey)));
 }
 async function runScheduledTick(ctx) {
-  const tasks = await ctx.db.getPendingTasks(50);
-  const summary = await deliverTasks(ctx, tasks);
-  await ctx.db.cleanupOldTasks(7);
+  try {
+    const tasks = await ctx.db.getPendingTasks(50);
+    return await deliverTasks(ctx, tasks);
+  } finally {
+    await runTickCleanup(ctx);
+  }
+}
+async function runTickCleanup(ctx) {
+  try {
+    await ctx.db.cleanupOldTasks(7);
+  } catch (error) {
+    console.warn("[amsg-server] cleanupOldTasks \u5931\u8D25\uFF08\u5DF2\u5FFD\u7565\uFF09:", error && error.message);
+  }
   if (typeof ctx.db.cleanupOutbox === "function") {
     try {
       await ctx.db.cleanupOutbox({
@@ -5962,7 +6338,6 @@ async function runScheduledTick(ctx) {
     }
   }
   await cleanupExpiredClientState(ctx);
-  return summary;
 }
 async function cleanupExpiredClientState(ctx) {
   if (typeof ctx.db.cleanupClientState !== "function") return;
@@ -9432,7 +9807,7 @@ function createClientStateNamespacesHandler(ctx) {
   }
   return { GET };
 }
-var SERVER_VERSION = true ? "3.1.0-next.1" : "0.0.0-dev";
+var SERVER_VERSION = true ? "3.1.0" : "0.0.0-dev";
 var SERVER_FEATURES = Object.freeze([
   "client-state",
   "client-state-chunking",
@@ -11214,158 +11589,8 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
   return { fetch: fetch2, scheduled, runTask: runTask2, getSchemaVersion: getSchemaVersion2, ensureSchema: ensureSchema2 };
 }
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-shared@0.4.0-next.11/node_modules/@rei-standard/amsg-shared/dist/index.mjs
-var TEXT_ENCODER2 = new TextEncoder();
-var TEXT_DECODER2 = new TextDecoder("utf-8", { fatal: false });
-function utf83(str) {
-  return TEXT_ENCODER2.encode(String(str));
-}
-var LLM_MESSAGES_ERROR2 = Object.freeze({
-  MESSAGES_NOT_ARRAY: "MESSAGES_NOT_ARRAY",
-  MESSAGE_NOT_OBJECT: "MESSAGE_NOT_OBJECT",
-  INVALID_ROLE: "INVALID_ROLE",
-  TOOL_CALL_MALFORMED: "TOOL_CALL_MALFORMED",
-  TOOL_CONTENT_INVALID: "TOOL_CONTENT_INVALID",
-  TOOL_CALL_ID_MISSING: "TOOL_CALL_ID_MISSING",
-  CONTENT_EMPTY_STRING: "CONTENT_EMPTY_STRING",
-  CONTENT_EMPTY_ARRAY: "CONTENT_EMPTY_ARRAY",
-  CONTENT_INVALID_TYPE: "CONTENT_INVALID_TYPE"
-});
-var UPSTREAM_ERROR_BODY_MAX_BYTES2 = 16 * 1024;
-var CREDENTIAL_LIKE_TOKEN2 = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]{16,}/g;
-var LONG_OPAQUE_RUN2 = /[A-Za-z0-9+/_.-]{48,}/g;
-var MODEL_ID_LIKE2 = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]{1,12})+$/;
-var MODEL_ID_MAX_CHARS2 = 64;
-var CREDENTIAL_PREFIX_SEGMENTS2 = /* @__PURE__ */ new Set([
-  "sk",
-  "pk",
-  "ak",
-  "api",
-  "apikey",
-  "key",
-  "token",
-  "secret",
-  "auth",
-  "bearer",
-  "session",
-  "sess",
-  "pat",
-  "xai",
-  "gsk"
-]);
-var UUID_SHAPE2 = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/;
-function alternationCount2(segment) {
-  return (segment.match(/[a-z]+|[0-9]+/g) || []).length;
-}
-var MOE_SIZE_SEGMENT2 = /^\d+x\d+b$/;
-var HEX_SEGMENT2 = /^[0-9a-f]+$/;
-var HEX_RUN_MAX_CHARS2 = 15;
-function looksLikeModelId2(token) {
-  if (token.length > MODEL_ID_MAX_CHARS2) return false;
-  if (!MODEL_ID_LIKE2.test(token)) return false;
-  if (UUID_SHAPE2.test(token)) return false;
-  const segments = token.split(/[.-]/);
-  if (CREDENTIAL_PREFIX_SEGMENTS2.has(segments[0])) return false;
-  let hexRunChars = 0;
-  for (const segment of segments) {
-    if (HEX_SEGMENT2.test(segment)) {
-      hexRunChars += segment.length;
-      if (hexRunChars > HEX_RUN_MAX_CHARS2) return false;
-    } else {
-      hexRunChars = 0;
-    }
-  }
-  return segments.every(
-    (segment) => alternationCount2(segment) < 3 || MOE_SIZE_SEGMENT2.test(segment)
-  );
-}
-function redactCredentials2(text2) {
-  let s = text2;
-  s = s.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]");
-  s = s.replace(CREDENTIAL_LIKE_TOKEN2, (token) => looksLikeModelId2(token) ? token : "[redacted]");
-  s = s.replace(LONG_OPAQUE_RUN2, (run) => {
-    const token = run.replace(/^[._+/-]+/, "").replace(/[._+/-]+$/, "");
-    return looksLikeModelId2(token) ? run : "[redacted]";
-  });
-  return s;
-}
-var KEY_INFO_PREFIX2 = utf83("WebPush: info\0");
-var CEK_INFO2 = utf83("Content-Encoding: aes128gcm\0");
-var NONCE_INFO2 = utf83("Content-Encoding: nonce\0");
-var VAPID_TOKEN_LIFETIME2 = 12 * 3600;
-var REI_SW_EVENT2 = Object.freeze({
-  CONTENT_RECEIVED: "rei-amsg-content-received",
-  REASONING_RECEIVED: "rei-amsg-reasoning-received",
-  TOOL_REQUEST_RECEIVED: "rei-amsg-tool-request-received",
-  ERROR_RECEIVED: "rei-amsg-error-received",
-  /** 宿主自定义的一条结果（`messageKind: 'result'`），不是聊天内容。 */
-  RESULT_RECEIVED: "rei-amsg-result-received",
-  MULTIPART_EXPIRED: "rei-amsg-multipart-expired",
-  UNKNOWN_RECEIVED: "rei-amsg-unknown-received"
-});
-var MULTIPART_FAILURE_REASON2 = Object.freeze({
-  /** TTL 到期仍未收齐，或收到的分片本身已经过期。 */
-  TTL_EXPIRED: "ttl-expired",
-  /** 分片信封不合规：version / encoding 对不上、index 越界、chunk 不是合法 base64url。 */
-  INVALID_CHUNK: "invalid-chunk",
-  /** 同一个 id 的分片报了不一样的 total / encoding，已收的部分拼不回去。 */
-  CHUNK_CONFLICT: "chunk-conflict",
-  /** 累计字节数超过 maxTotalBytes。 */
-  SIZE_LIMIT_EXCEEDED: "size-limit-exceeded",
-  /** 收齐了但拼不回原 payload（缺片、超限、JSON 解不开）。 */
-  RESTORE_FAILED: "restore-failed",
-  /** 分片仓库（IndexedDB）读写失败。 */
-  STORAGE_FAILED: "storage-failed",
-  /** 接收端把 multipart 关了（`multipart.enabled === false`），分片没法重组。 */
-  DISABLED: "disabled"
-});
-var REI_SW_MESSAGE_TYPE2 = Object.freeze({
-  ENQUEUE_REQUEST: "REI_ENQUEUE_REQUEST",
-  DELIVER: "REI_AMSG_DELIVER",
-  FLUSH_QUEUE: "REI_FLUSH_QUEUE",
-  /**
-   * 入队的点对点回执：谁发的 ENQUEUE_REQUEST 就回给谁一条，一次一条。
-   * 没转 MessagePort 过来时会落到全局的 `navigator.serviceWorker` message
-   * 监听器上。
-   */
-  QUEUE_RESULT: "REI_QUEUE_RESULT",
-  /**
-   * 队列请求被永久拒绝、即将从队列里删掉时广播给所有窗口的一条。
-   *
-   * 跟 QUEUE_RESULT 分开是因为两者的收信人不是一回事：这条是广播，可能来自后台
-   * `sync` 冲刷、说的也可能是另一条八竿子打不着的旧请求。共用一个 type 的话，
-   * 页面等自己那条入队回执时会先收到这一条、当成自己的结果处理。
-   */
-  QUEUE_DROPPED: "REI_QUEUE_DROPPED"
-});
-var REI_AMSG_DELIVER_MESSAGE_TYPE2 = REI_SW_MESSAGE_TYPE2.DELIVER;
-var MESSAGE_KIND2 = Object.freeze({
-  CONTENT: "content",
-  REASONING: "reasoning",
-  TOOL_REQUEST: "tool_request",
-  ERROR: "error",
-  RESULT: "result"
-});
-var MESSAGE_TYPE2 = Object.freeze({
-  INSTANT: "instant",
-  FIXED: "fixed",
-  PROMPTED: "prompted",
-  AUTO: "auto"
-});
-var PUSH_SOURCE2 = Object.freeze({
-  INSTANT: "instant",
-  SCHEDULED: "scheduled"
-});
-var REASONING_CHUNK_ENCODER2 = new TextEncoder();
-var REASONING_CHUNK_DECODER2 = new TextDecoder("utf-8", { fatal: true });
-var REASONING_TAG_RE_G2 = /<(think|thinking|thought)>[\s\S]*?<\/\1>/gi;
-function stripReasoningTags2(content) {
-  if (typeof content !== "string" || !content.includes("<")) return content;
-  return content.replace(REASONING_TAG_RE_G2, "").trim();
-}
-
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-10-22";
+var AMSG_BUNDLE_VERSION = "2026-11-02";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -11419,7 +11644,7 @@ var readBodyError = (body, hasChoices) => {
     const topLevel = body.message ?? body.msg;
     if (typeof topLevel === "string") text2 = topLevel;
   }
-  return text2 ? clip(redactCredentials2(text2), BODY_ERROR_MAX_CHARS) : null;
+  return text2 ? clip(redactCredentials(text2), BODY_ERROR_MAX_CHARS) : null;
 };
 var describeLlmResponseShape = (llmResponse, llmOutputText) => {
   const body = asRecord(llmResponse);
@@ -11440,7 +11665,7 @@ var describeLlmResponseShape = (llmResponse, llmOutputText) => {
     contentType,
     contentChars,
     ...Array.isArray(content) ? { contentParts: content.length } : {},
-    visibleChars: stripReasoningTags2(llmOutputText || "").trim().length,
+    visibleChars: stripReasoningTags(llmOutputText || "").trim().length,
     reasoningChars: readReasoning(message).length,
     toolCalls: Array.isArray(message?.tool_calls) ? message.tool_calls.length : 0,
     usage: usage ? {
@@ -11455,23 +11680,23 @@ var excerptLlmResponse = (llmResponse) => {
   const body = asRecord(llmResponse);
   const hasChoices = Array.isArray(body?.choices) && body.choices.length > 0;
   if (!hasChoices) {
-    return { body: clip(redactCredentials2(safeStringify(llmResponse)), BODY_EXCERPT_CHARS) };
+    return { body: clip(redactCredentials(safeStringify(llmResponse)), BODY_EXCERPT_CHARS) };
   }
   const { message } = readFirstMessage(body);
   const excerpt = {};
   const content = message?.content;
   if (typeof content === "string") {
-    if (content) excerpt.content = clip(redactCredentials2(content), CONTENT_EXCERPT_CHARS);
+    if (content) excerpt.content = clip(redactCredentials(content), CONTENT_EXCERPT_CHARS);
   } else if (content != null) {
-    excerpt.content = clip(redactCredentials2(safeStringify(content)), CONTENT_EXCERPT_CHARS);
+    excerpt.content = clip(redactCredentials(safeStringify(content)), CONTENT_EXCERPT_CHARS);
   }
   const reasoning = readReasoning(message);
   if (reasoning) {
     const tail = reasoning.length > REASONING_TAIL_CHARS ? `\u2026${reasoning.slice(-REASONING_TAIL_CHARS)}` : reasoning;
-    excerpt.reasoningTail = redactCredentials2(tail);
+    excerpt.reasoningTail = redactCredentials(tail);
   }
   if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
-    excerpt.toolCalls = clip(redactCredentials2(safeStringify(message.tool_calls)), CONTENT_EXCERPT_CHARS);
+    excerpt.toolCalls = clip(redactCredentials(safeStringify(message.tool_calls)), CONTENT_EXCERPT_CHARS);
   }
   return excerpt;
 };
@@ -12833,7 +13058,8 @@ var buildUserHolidayBlock = async (args) => {
   }, nowMs, args.userName);
 };
 var buildRealtimeWorldBlock = async (args) => {
-  const { toolConfig: cfg, nowMs, globalRows } = args;
+  const { nowMs, globalRows } = args;
+  const cfg = weatherForCharacter(args.toolConfig, args.charId);
   const specialDates = args.timeAwarenessEnabled ? checkSpecialDates(args.tzId, nowMs) : [];
   if (!cfg.weatherEnabled && !cfg.newsEnabled) {
     return renderRealtimeWorldBlock({ specialDates });
@@ -13184,6 +13410,27 @@ var handleInstantChat = async (args) => {
   });
 };
 
+// utils/amsgSelfUpdateState.ts
+var findCfTokenRejection = (text2) => /\d+: invalid (access|api) token/i.exec(text2)?.[0] ?? null;
+var cfTokenRejectedMessage = (detail, hasAccountId) => `Cloudflare \u4E0D\u8BA4\u8FD9\u679A CF_API_TOKEN\uFF08${detail}\uFF09\uFF0C\u591A\u534A\u5DF2\u7ECF\u8FC7\u671F\u6216\u88AB\u5220\u4E86\u3002\u53BB Cloudflare \u65B0\u5EFA\u4E00\u679A\uFF08\u53EA\u52FE Workers Scripts \u2192 Edit\uFF09\uFF0C\u66FF\u6362 Worker \u91CC\u7684 CF_API_TOKEN\u3002` + (hasAccountId ? "" : "\u5982\u679C\u5B83\u662F cfat_ \u5F00\u5934\u7684\u8D26\u53F7\u4EE4\u724C\uFF0C\u6362\u6210\u666E\u901A API Token\uFF0C\u6216\u8005\u7ED9 Worker \u52A0\u4E00\u6761 CF_ACCOUNT_ID\u3002");
+var OUTCOMES = /* @__PURE__ */ new Set(["updated", "up_to_date", "failed"]);
+var SOURCES = /* @__PURE__ */ new Set(["cron", "client", "manual"]);
+var parseAmsgSelfUpdateState = (raw) => {
+  const value = raw;
+  if (!value || typeof value !== "object") return null;
+  if (typeof value.lastCheckAt !== "string" || Number.isNaN(Date.parse(value.lastCheckAt))) return null;
+  if (typeof value.lastOutcome !== "string" || !OUTCOMES.has(value.lastOutcome)) return null;
+  const error = value.lastError;
+  return {
+    lastCheckAt: value.lastCheckAt,
+    lastSource: typeof value.lastSource === "string" && SOURCES.has(value.lastSource) ? value.lastSource : "cron",
+    lastOutcome: value.lastOutcome,
+    bundleHash: typeof value.bundleHash === "string" && value.bundleHash ? value.bundleHash : null,
+    lastUpdatedAt: typeof value.lastUpdatedAt === "string" ? value.lastUpdatedAt : null,
+    lastError: error && typeof error === "object" && typeof error.code === "string" ? { code: error.code, message: typeof error.message === "string" ? error.message : "" } : null
+  };
+};
+
 // worker/amsg/src/selfUpdate.ts
 var CF_API = "https://api.cloudflare.com/client/v4";
 var BUNDLE_URL = "https://raw.githubusercontent.com/Tosd0/sullyos-workers/main/amsg/worker.bundle.js";
@@ -13257,18 +13504,20 @@ async function locateScript(env, token, scriptName) {
   if (configured) {
     const settings = await cf(token, settingsPath(configured));
     if (!settings.ok) {
+      const rejected = findCfTokenRejection(settings.detail);
       return {
         ok: false,
-        message: `\u5728 CF_ACCOUNT_ID \u6307\u5B9A\u7684\u8D26\u53F7\u91CC\u8BFB\u4E0D\u5230\u8FD9\u4E2A Worker \u7684\u914D\u7F6E\uFF08${settings.detail}\uFF09\u3002`
+        message: rejected ? cfTokenRejectedMessage(rejected, true) : `\u5728 CF_ACCOUNT_ID \u6307\u5B9A\u7684\u8D26\u53F7\u91CC\u8BFB\u4E0D\u5230\u8FD9\u4E2A Worker \u7684\u914D\u7F6E\uFF08${settings.detail}\uFF09\u3002`
       };
     }
     return { ok: true, accountId: configured, settings: settings.result };
   }
   const listed = await cf(token, "/accounts");
   if (!listed.ok) {
+    const rejected = findCfTokenRejection(listed.detail);
     return {
       ok: false,
-      message: `\u95EE\u4E0D\u5230\u8D26\u53F7\u5217\u8868\uFF08${listed.detail}\uFF09\u3002\u7ED9 Worker \u52A0\u4E00\u6761 CF_ACCOUNT_ID \u53D8\u91CF\u5373\u53EF\u8DF3\u8FC7\u8FD9\u4E00\u6B65\u3002`
+      message: rejected ? cfTokenRejectedMessage(rejected, false) : `\u95EE\u4E0D\u5230\u8D26\u53F7\u5217\u8868\uFF08${listed.detail}\uFF09\u3002\u7ED9 Worker \u52A0\u4E00\u6761 CF_ACCOUNT_ID \u53D8\u91CF\u5373\u53EF\u8DF3\u8FC7\u8FD9\u4E00\u6B65\u3002`
     };
   }
   const accounts = Array.isArray(listed.result) ? listed.result : [];
@@ -13434,25 +13683,6 @@ async function handleSelfUpdate(request, env) {
   if (!fetched.ok) return fail("BUNDLE_INVALID", fetched.message);
   return performSelfUpdate(env, gate.token, scriptName, fetched.bundle);
 }
-
-// utils/amsgSelfUpdateState.ts
-var OUTCOMES = /* @__PURE__ */ new Set(["updated", "up_to_date", "failed"]);
-var SOURCES = /* @__PURE__ */ new Set(["cron", "client", "manual"]);
-var parseAmsgSelfUpdateState = (raw) => {
-  const value = raw;
-  if (!value || typeof value !== "object") return null;
-  if (typeof value.lastCheckAt !== "string" || Number.isNaN(Date.parse(value.lastCheckAt))) return null;
-  if (typeof value.lastOutcome !== "string" || !OUTCOMES.has(value.lastOutcome)) return null;
-  const error = value.lastError;
-  return {
-    lastCheckAt: value.lastCheckAt,
-    lastSource: typeof value.lastSource === "string" && SOURCES.has(value.lastSource) ? value.lastSource : "cron",
-    lastOutcome: value.lastOutcome,
-    bundleHash: typeof value.bundleHash === "string" && value.bundleHash ? value.bundleHash : null,
-    lastUpdatedAt: typeof value.lastUpdatedAt === "string" ? value.lastUpdatedAt : null,
-    lastError: error && typeof error === "object" && typeof error.code === "string" ? { code: error.code, message: typeof error.message === "string" ? error.message : "" } : null
-  };
-};
 
 // utils/amsgTickReport.ts
 var TICK_STALL_MS = 5 * 6e4;
@@ -14319,6 +14549,24 @@ var postCore = async (target, session, body, timeoutMs, expectResponse = true) =
     target.signal?.removeEventListener("abort", abort);
   }
 };
+var formatMcpRpcError = (err6) => {
+  const code = err6?.code !== void 0 ? `[${err6.code}]: ` : "";
+  const message = err6?.message || "\u672A\u77E5\u9519\u8BEF";
+  let dataText = "";
+  if (err6?.data !== void 0 && err6?.data !== null && err6?.data !== "") {
+    if (typeof err6.data === "string") {
+      dataText = err6.data.trim();
+    } else {
+      try {
+        dataText = JSON.stringify(err6.data);
+      } catch {
+        dataText = String(err6.data);
+      }
+    }
+  }
+  const suffix = dataText && !message.includes(dataText) ? `\uFF08${dataText}\uFF09` : "";
+  return `${code}${message}${suffix}`;
+};
 var initializeCore = async (target, session, timeoutMs) => {
   const initReq = buildRpcRequest(session, "initialize", {
     protocolVersion: MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION,
@@ -14326,7 +14574,7 @@ var initializeCore = async (target, session, timeoutMs) => {
     clientInfo: { name: "sullyos", title: "SullyOS", version: "1.0.0" }
   });
   const { response } = await postCore(target, session, initReq, timeoutMs);
-  if (response?.error) throw new Error(`Initialize \u5931\u8D25: ${response.error.message}`);
+  if (response?.error) throw new Error(`Initialize \u5931\u8D25 ${formatMcpRpcError(response.error)}`);
   const negotiated = String(
     response?.result?.protocolVersion || MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION
   );
@@ -14472,7 +14720,7 @@ var callMcpToolCore = async (target, session, toolName, args = {}, opts = {}) =>
       }
     }
     if (!response) return finish({ success: false, error: "\u7A7A\u54CD\u5E94" });
-    if (response.error) return finish({ success: false, error: `MCP \u9519\u8BEF [${response.error.code}]: ${response.error.message}` });
+    if (response.error) return finish({ success: false, error: `MCP \u9519\u8BEF ${formatMcpRpcError(response.error)}` });
     const result = response.result;
     if (result?.resultType === "input_required") {
       return finish({
@@ -16416,12 +16664,52 @@ function deduplicateVoiceText(text2) {
   }).join("\n").replace(/\u0002VOICE(\d+)\u0002/g, (_, i) => blocks[Number(i)]).trim();
 }
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-instant@0.11.0-next.9/node_modules/@rei-standard/amsg-instant/dist/index.mjs
+// utils/friendFeedReplyFormat.ts
+var FRIEND_FEED_MAIN_PROMPT_PREFIX = "\u3010\u987A\u4FBF\u56DE\u597D\u53CB\u5708\u3011";
+function extractFriendFeedReplyTags(raw, namespace = "FRIEND_FEED_REPLY") {
+  const marker = new RegExp("\\[\\[" + namespace + "\\s*:", "gi");
+  const actions = [];
+  let text2 = "", cursor = 0, match;
+  while (match = marker.exec(raw)) {
+    text2 += raw.slice(cursor, match.index);
+    let start = marker.lastIndex;
+    while (start < raw.length && /\s/.test(raw[start])) start++;
+    let depth = 0, quoted = false, escaped = false, end = -1;
+    if (raw[start] === "{") for (let i = start; i < raw.length; i++) {
+      const c = raw[i];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === '"') quoted = false;
+      } else if (c === '"') quoted = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) {
+        end = i + 1;
+        break;
+      }
+    }
+    const close = end >= 0 ? /^\s*\]\]/.exec(raw.slice(end)) : null;
+    if (close) {
+      try {
+        actions.push(JSON.parse(raw.slice(start, end)));
+      } catch {
+      }
+      cursor = end + close[0].length;
+    } else {
+      const fallback = raw[start] === "{" && end < 0 ? -1 : raw.indexOf("]]", end >= 0 ? end : start);
+      cursor = fallback < 0 ? raw.length : fallback + 2;
+    }
+    marker.lastIndex = cursor;
+  }
+  return { text: text2 + raw.slice(cursor), actions };
+}
+
+// node_modules/.pnpm/@rei-standard+amsg-instant@0.11.0/node_modules/@rei-standard/amsg-instant/dist/index.mjs
 var WEB_PUSH_MAX_BODY_BYTES2 = 4096;
 var WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES2 = 16 + 4 + 1 + 65 + 1 + 16;
 var MAX_PUSH_PAYLOAD_BYTES2 = WEB_PUSH_MAX_BODY_BYTES2 - WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES2;
 var PROBE_BYTE_ENCODER = new TextEncoder();
-var LONGEST_MESSAGE_KIND = Object.values(MESSAGE_KIND2).reduce((longest, kind) => kind.length > longest.length ? kind : longest, "");
+var LONGEST_MESSAGE_KIND = Object.values(MESSAGE_KIND).reduce((longest, kind) => kind.length > longest.length ? kind : longest, "");
 var PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
 function segmentTextWithProtectedBlocks(text2, options) {
   if (!text2) return [];
@@ -16511,7 +16799,7 @@ var stripLeakedSourceTags = (t) => t.replace(
 var stripTimestamps = (t) => t.replace(/\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*/g, "").replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*/gm, "").replace(/（[上下]午\d{1,2}[：:]\d{2}）/g, "").replace(/\(\d{1,2}:\d{2}\s*[AP]M\)/gi, "");
 var stripChineseDate = (t) => t.replace(/\[\d{4}[-/年]\d{1,2}[-/月]\d{1,2}.*?\]/g, "");
 var stripRoleNamePrefix = (t) => t.replace(/^[\w一-龥]+:\s*/, "");
-var stripBusinessTagsForBubble = (t) => t.replace(/\[\[(?:ACTION|RECALL|SEARCH|DIARY|READ_DIARY|FS_DIARY|FS_READ_DIARY|DIARY_START|DIARY_END|FS_DIARY_START|FS_DIARY_END|MUSIC_ACTION)[:\s][\s\S]*?\]\]/g, "").replace(/\[\[\s*[记記][录錄]\s*[:：][\s\S]*?\]\]/g, "").replace(/\[schedule_message[^\]]*\]/g, "");
+var stripBusinessTagsForBubble = (t) => extractFriendFeedReplyTags(extractFriendFeedReplyTags(t).text, "HOME_VISIT_REPLY").text.replace(/\[\[(?:ACTION|RECALL|SEARCH|DIARY|READ_DIARY|FS_DIARY|FS_READ_DIARY|DIARY_START|DIARY_END|FS_DIARY_START|FS_DIARY_END|MUSIC_ACTION)[:\s][\s\S]*?\]\]/g, "").replace(/\[\[\s*[记記][录錄]\s*[:：][\s\S]*?\]\]/g, "").replace(/\[schedule_message[^\]]*\]/g, "");
 var stripBusinessTagsForNotification = (t) => stripBusinessTagsForBubble(t).replace(/\[\[(?:READ_NOTE|XHS_[A-Z_]+|LIFE|NEWS_CARD)[:\s][\s\S]*?\]\]/g, "").replace(/\[\[XHS_[A-Z_]+\]\]/g, "");
 var stripAllDoubleBracketTags = (t) => t.replace(/\[\[[\s\S]*?\]\]/g, "");
 var stripQuotes2 = (t) => t.replace(/\[\[(?:QU[OA]TE|引用)[：:][\s\S]*?\]\]/g, "").replace(/\[(?:QU[OA]TE|引用)[：:][^\]]*\]/g, "").replace(/\[回复\s*[""“][^""”]*?[""”](?:\.{0,3})\]\s*[：:]?\s*/g, "").replace(/\[[^\[\]\n「」]{0,24}引用了[^\[\]\n「」]{0,24}「[^」\n]*?」[^\[\]\n]{0,24}\]\s*/g, "");
@@ -17134,6 +17422,9 @@ function parseDiaryShort(m, type) {
   return { type, title, content };
 }
 function classifyLLMOutput(text2) {
+  const social = extractFriendFeedReplyTags(text2);
+  const visits = extractFriendFeedReplyTags(social.text, "HOME_VISIT_REPLY");
+  text2 = visits.text;
   const toolCalls = [];
   for (const spec of DATA_TAGS) {
     const matches = Array.from(text2.matchAll(spec.re));
@@ -17151,11 +17442,14 @@ function classifyLLMOutput(text2) {
     let prefix = text2;
     for (const spec of DATA_TAGS) prefix = prefix.replace(spec.re, "");
     prefix = prefix.trim();
+    if (social.actions.length) prefix += "\n" + social.actions.map((action) => "[[FRIEND_FEED_REPLY:" + JSON.stringify(action) + "]]").join("\n");
+    if (visits.actions.length) prefix += "\n" + visits.actions.map((action) => "[[HOME_VISIT_REPLY:" + JSON.stringify(action) + "]]").join("\n");
     const sanitizedPrefix = sanitizeForNotification(prefix);
     return { kind: "tool-request", prefix, sanitizedPrefix, toolCalls };
   }
-  const directives = [];
-  const { text: textAfterTransfers, events: transferEvents } = extractTransferCommands(text2);
+  const directives = social.actions.map((action) => ({ type: "friend_feed_reply", action }));
+  directives.push(...visits.actions.map((action) => ({ type: "home_visit_reply", action })));
+  const { text: textAfterTransfers, events: transferEvents } = extractTransferCommands(visits.text);
   for (const ev of transferEvents) {
     if (ev.kind === "send") {
       const amount = parseTransferAmount(ev.amount);
@@ -17719,7 +18013,8 @@ var takeEmotionEvalSpec = (metadata) => {
 };
 var EMOTION_EVAL_RIDE_ALONG_MS = 1e4;
 var runAmsgEmotionEval = async (spec, api, chatMessages, charName, timeoutMs = EMOTION_EVAL_TIMEOUT_MS, signal) => {
-  const result = await requestEmotionEval(api, restoreEvalPrompt(spec.prompt, chatMessages, charName), timeoutMs, signal);
+  const emotionMessages = chatMessages.filter((message) => !(message.role === "system" && typeof message.content === "string" && message.content.startsWith(FRIEND_FEED_MAIN_PROMPT_PREFIX)));
+  const result = await requestEmotionEval(api, restoreEvalPrompt(spec.prompt, emotionMessages, charName), timeoutMs, signal);
   return result.raw ? { ...result, raw: tagHomeSecretEval(result.raw, spec.homeSecretRequestId) } : result;
 };
 
@@ -17737,13 +18032,13 @@ function buildScheduleChangeResult(args) {
 
 // worker/amsg/src/nativeFcm.ts
 var accessTokenCache = null;
-var utf84 = new TextEncoder();
+var utf83 = new TextEncoder();
 var bytesToB64u = (bytes) => {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 };
-var textToB64u = (value) => bytesToB64u(utf84.encode(value));
+var textToB64u = (value) => bytesToB64u(utf83.encode(value));
 var pemToPkcs8 = (raw) => {
   const base64 = raw.replace(/\\n/g, "\n").replace(/-----BEGIN PRIVATE KEY-----/g, "").replace(/-----END PRIVATE KEY-----/g, "").replace(/\s+/g, "");
   if (!base64) throw new Error("FCM_SERVICE_ACCOUNT_PRIVATE_KEY \u4E0D\u662F\u6709\u6548\u7684 PKCS#8 PEM");
@@ -17780,7 +18075,7 @@ var fetchFcmAccessToken = async (env) => {
     false,
     ["sign"]
   );
-  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, utf84.encode(unsigned));
+  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, utf83.encode(unsigned));
   const assertion = `${unsigned}.${bytesToB64u(new Uint8Array(signature))}`;
   const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -17833,7 +18128,7 @@ var buildFcmMessage = (token, rawPayload) => {
       }
     }
   };
-  const bytes = utf84.encode(JSON.stringify(result)).byteLength;
+  const bytes = utf83.encode(JSON.stringify(result)).byteLength;
   if (bytes > 4e3) throw new Error(`FCM_PAYLOAD_TOO_LARGE: ${bytes} bytes\uFF08\u5B89\u5168\u4E0A\u9650 4000\uFF09`);
   return result;
 };
@@ -17867,6 +18162,7 @@ var isFcmConfigured = (env) => Boolean(
 );
 
 // worker/amsg/src/index.ts
+installAnthropicFetch(false);
 var getFireStash = (scratch) => scratch?.fire;
 var REPLY_IN_FLIGHT_DEFER_MS = 45e3;
 var laterOf = (a, b) => a == null ? b : b == null ? a : Math.max(a, b);
@@ -18192,6 +18488,14 @@ var amsgFireSettled = async (info) => {
   if (stash.selfLogDirty) {
     stash.selfLogDirty = false;
     stateWrites.push({ key: AMSG_SELF_LOG_KEY, value: JSON.stringify(stash.selfLog) });
+  }
+  if (stash.staleStoppedKeys && stash.staleStoppedKeys.length > 0) {
+    const staleKeys = stash.staleStoppedKeys;
+    stash.staleStoppedKeys = [];
+    for (const key of staleKeys) {
+      if (stateWrites.length >= 190) break;
+      stateWrites.push({ key, value: null });
+    }
   }
   if (stateWrites.length > 0) {
     try {
@@ -18749,7 +19053,14 @@ var amsgHooks = {
       }
       return { skip: true };
     }
-    const storedSelfLog = reconcileStoppedReplies(parseSelfLog(charRows.find((r) => r.key === AMSG_SELF_LOG_KEY)?.value ?? ""), charRows);
+    const rawSelfLog = parseSelfLog(charRows.find((r) => r.key === AMSG_SELF_LOG_KEY)?.value ?? "");
+    const storedSelfLog = reconcileStoppedReplies(rawSelfLog, charRows);
+    const selfLogReconciled = storedSelfLog !== rawSelfLog;
+    const staleStoppedKeys = pickStaleStoppedReplyKeys(
+      charRows,
+      ctx.now.getTime(),
+      typeof ctx.task.uuid === "string" && ctx.task.uuid ? stoppedReplyKey(ctx.task.uuid) : null
+    );
     const selfLog = reconcileSelfLogWithPack(storedSelfLog, pack, lastUserMessageAt);
     const taskBrief = findTaskBrief([...pack.pendingTasks, ...selfLog.tasks], ctx.task.uuid);
     const clientTaskId = typeof taskMeta.amsgClientTaskId === "string" ? taskMeta.amsgClientTaskId : "";
@@ -18859,7 +19170,8 @@ var amsgHooks = {
       xhsCookie,
       occurrenceMs,
       selfLog,
-      selfLogDirty: false,
+      selfLogDirty: selfLogReconciled && staleStoppedKeys.length > 0,
+      staleStoppedKeys,
       mcpResolve,
       maxToolIterations,
       fireToolNames: /* @__PURE__ */ new Set(),
@@ -18908,6 +19220,7 @@ var amsgHooks = {
     const taskListBlock = baseTaskListBlock && canManageTasks ? `${baseTaskListBlock}
 \uFF08\u6E05\u5355\u91CC\u7684\u4EFB\u52A1\u5F52\u4F60\u7BA1\uFF1A\u60C5\u51B5\u53D8\u4E86\u4E0D\u8BE5\u54CD\u7684\u53EF\u4EE5\u7528 cancel_active_message \u53D6\u6D88\uFF0C\u53EA\u662F\u8981\u6362\u65F6\u95F4\u7684\u7528 renew_active_message \u6539\u671F\uFF0Ctask_id \u5C31\u662F\u6E05\u5355\u91CC\u7684\u77ED id\u3002\uFF09` : baseTaskListBlock;
     const worldArgs = {
+      charId,
       toolConfig,
       userName: pack.targetName,
       timeAwarenessEnabled: toolPack.timeAwarenessEnabled,
@@ -19044,7 +19357,7 @@ ${userHoliday}` });
       }
       return handler.llmOutput({ ctx, state: kindFire.state });
     }
-    const content = stripReasoningTags2(ctx.llmOutputText || "").trim();
+    const content = stripReasoningTags(ctx.llmOutputText || "").trim();
     const taskId = ctx.taskId != null ? String(ctx.taskId) : null;
     if (taskId == null) {
       console.warn("[amsg:agentic] ctx \u4E0A\u6CA1\u6709 taskId\uFF0C\u9001\u8FBE\u5F52\u5C5E\u4F1A\u5931\u6548", ctx.sessionId);
@@ -19669,6 +19982,7 @@ var src_default = {
         data: {
           ...inspectWorkerEnv(env),
           instantChat: true,
+          anthropicMessages: true,
           instantTick: !!env.INSTANT_TICK,
           // 这份代码认不认识「后台任务」（metadata.amsgKind → handler，见 fireKinds.ts）。
           // 老 bundle 没有这个字段，前端据此不去建那种任务——老 worker 会把它当聊天任务
