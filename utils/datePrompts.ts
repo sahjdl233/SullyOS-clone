@@ -30,6 +30,7 @@ import { getElevenLabsVoiceActingGuide } from './elevenLabsTts';
 import { isElevenLabsV4Model } from './elevenLabsModels';
 import { selectCharacterContextMessages } from './chatContextRange';
 import { buildCharacterResponsePrinciples } from './characterResponsePrinciples';
+import { resolveCharacterUser } from './userPersona';
 
 /** Adapted from story preset character-polyphony / evidence-gate / user-agency.
  * In-person companionship permits a small beat; it does not require plot escalation.
@@ -661,7 +662,8 @@ export const DatePrompts = {
         openingMode?: 'approach' | 'invite';
     }): Promise<{ messages: ApiMessage[] }> => {
 
-        const { char, userProfile, allMsgs, emojis } = input;
+        const { char, allMsgs, emojis } = input;
+        const userProfile = resolveCharacterUser(input.userProfile, char);
         const charTz = resolveCharTimeZone(char);
         const dateTimeOn = isDateTimeAwarenessOn(char);
         const timeStr = dateTimeOn ? getRealTimeStr(charTz) : '';
@@ -746,9 +748,12 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
         userText: string;
         variant: 'send' | 'reroll';
         useVisionDescriptions?: boolean;
+        /** 见面期间作废的主动消息（amsg2TaskContext.buildInPersonNoticesText），可提可不提。 */
+        inPersonNotes?: string | null;
     }): Promise<{ messages: ApiMessage[] }> => {
 
-        const { char, userProfile, allMsgs, emojis, userText, variant } = input;
+        const { char, allMsgs, emojis, userText, variant } = input;
+        const userProfile = resolveCharacterUser(input.userProfile, char);
 
         const historyMsgs = buildDateHistory(
             allMsgs,
@@ -786,6 +791,7 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
                 ...messagesWithWorldbooks.map(message => message === pendingMessage
                     ? { ...message, content: `${userText}\n\n${note}` }
                     : message),
+                ...(input.inPersonNotes ? [{ role: 'system', content: input.inPersonNotes }] : []),
                 { role: 'system', content: buildDateInteractionPrinciples(char.name, userProfile?.name || '对方') },
             ],
         };
