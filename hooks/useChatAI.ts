@@ -6,6 +6,7 @@ import { CharacterProfile, UserProfile, Message, Emoji, EmojiCategory, GroupProf
 import { DB } from '../utils/db';
 import { ChatPrompts } from '../utils/chatPrompts';
 import { safeFetchJson, safeResponseJson } from '../utils/safeApi';
+import type { ApiCallMeta } from '../utils/apiCallLog';
 import { KeepAlive } from '../utils/keepAlive';
 import { ContextBuilder } from '../utils/context';
 import { ChatParser } from '../utils/chatParser';
@@ -42,6 +43,7 @@ import {
 import { ActiveMsgStore } from '../utils/activeMsgStore';
 import { markAmsgStateDirty, startAmsgChatPresence, stopAmsgChatPresence } from '../utils/amsgStateSync';
 import { getLastRealUserMessageAt } from '../utils/amsg2ExpireGuard';
+import { getLastAwayAnchorAt } from '../utils/awayMessageCore';
 import { syncCloudAwayTask } from '../utils/awayMessage';
 import { disarmDateLeaveReminder } from '../utils/dateLeaveReminder';
 import { getPendingTasks, hasActiveAiTask, isAmsg2EnabledForChar } from '../utils/amsg2Tasks';
@@ -372,6 +374,7 @@ export async function evaluateEmotionBackground(
     api: { baseUrl: string; apiKey: string; model: string; stream?: boolean },
     signal?: AbortSignal,
     secretOrigin?: SecretNoteOriginPromise,
+    metaOverride?: Partial<ApiCallMeta>,
 ): Promise<string | null> {
     // 全局横幅「xx 正在感受…」（ChatBroadcast）。这里是所有本地评估路径的汇聚点
     // （主链路 fire & forget / OSContext 主动消息），在函数级
@@ -407,7 +410,14 @@ export async function evaluateEmotionBackground(
             // injection+innerState 很长, 会被截断成半截 JSON → buff 静默丢失.
             max_tokens: 8000,
         };
-        const evalMeta = { appName: '消息', charId: charData.id, charName: charData.name, purpose: '情绪评估' };
+        const evalMeta: ApiCallMeta = {
+            appId: 'chat',
+            appName: '消息',
+            charId: charData.id,
+            charName: charData.name,
+            purpose: '情绪评估',
+            ...metaOverride,
+        };
         let data: any;
         try {
             data = await safeFetchJson(`${baseUrl}/chat/completions`, {
@@ -784,8 +794,8 @@ export const useChatAI = ({
             }
             const fullHistory = contextRange?.messages || null;
             const contextMsgs = fullHistory || currentMsgs;
-            // 离开后消息（云端）：对方刚开过口，把那条任务往后推。不等它，失败只影响这一条。
-            const awayLastUserAt = getLastRealUserMessageAt(contextMsgs);
+            // 离开后消息（云端）：按最近一次在场互动（用户发言或线下见面/通话记录）把任务往后推。不等它，失败只影响这一条。
+            const awayLastUserAt = getLastAwayAnchorAt(contextMsgs);
             if (char.awayMessage?.enabled && awayLastUserAt != null) {
                 void syncCloudAwayTask({
                     char, lastUserAt: awayLastUserAt, userProfile, groups, realtimeConfig, apiConfig, updateCharacter,
@@ -1134,7 +1144,7 @@ export const useChatAI = ({
             //  - thinking.type='enabled' / budget_tokens：Anthropic 原生与多数官方代理
             //  - reasoning_effort：OpenAI 系（o1/o3、GLM-4.5、deepseek-reasoner 等）
             //  - extra_body.thinking：LiteLLM 系桥
-            // 关掉则一个都不传，避免无谓的 thinking token 计费。
+            // 关掉则不主动传这些参数；这不等于关闭模型推理，Gemini 等仍可能产生思考用量。
             // ⚠️ 工具模式(瑞幸点单/麦当劳)下绝不带 thinking/reasoning 参数: "thinking + tools" 同发
             //    Gemini 等会直接 400 INVALID_ARGUMENT —— 表现就是"开了思考链的角色一点单就报错,
             //    换个没开思考链的角色就好"。工具循环优先, 思考链这一轮让步。
@@ -1629,7 +1639,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '麦当劳点餐回复' }));
                     updateTokenUsage(data, historyMsgCount, `mcd-propose-${it + 1}`);
                     // 第二轮跳过 (我们已经禁用了 tools)
                     if (!data.choices?.[0]?.message?.tool_calls?.length) break;
@@ -1735,7 +1745,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '瑞幸点单回复' }));
                     updateTokenUsage(data, historyMsgCount, `luckin-propose-${it + 1}`);
                     if (!data.choices?.[0]?.message?.tool_calls?.length) break;
                 }
@@ -1916,11 +1926,16 @@ export const useChatAI = ({
                         delete followBody.tools;
                         delete followBody.tool_choice;
                     }
+                    const loopPurpose = payload.flags.luckinChatActive
+                        ? '瑞幸点单续写'
+                        : mcpCallsThisRound > 0
+                            ? 'MCP 工具续写'
+                            : '排程工具续写';
                     data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: loopPurpose }));
                     updateTokenUsage(data, historyMsgCount, `${payload.flags.luckinChatActive ? 'luckin-chat' : 'mcp-chat'}-${it + 1}`);
                     if (forceWrapUp) break;
                 }
@@ -1946,7 +1961,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(rescueBody),
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '排程后补充回复' }));
                     updateTokenUsage(data, historyMsgCount, 'amsg2-empty-rescue');
                 }
                 if (amsg2ToolRounds > 0) {
@@ -1997,7 +2012,7 @@ export const useChatAI = ({
                             signal: replyRun.signal,
                             method: 'POST', headers,
                             body: JSON.stringify(wrapBody)
-                        }));
+                        }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: 'MCP 工具收尾回复' }));
                         updateTokenUsage(data, historyMsgCount, `mcp-text-wrap-${it + 1}`);
                         break;
                     }
@@ -2035,7 +2050,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: 'MCP 工具续写' }));
                     updateTokenUsage(data, historyMsgCount, `mcp-text-${it + 1}`);
                     if (reachedHardLimit) break;
                 }

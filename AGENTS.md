@@ -13,14 +13,18 @@
 | 主题 | 文档 | 什么时候看 |
 |------|------|-----------|
 | **用户空间 / 角色继承 / 共享素材** | [`docs/user-spaces.md`](./docs/user-spaces.md) | 改用户切换、角色专属用户资料、跨空间继承、备份范围或素材删除前必读；会话固定所属空间、配置独立文件共用、继承不带经历、定位隐私不备份 |
-| **悬浮球与全局返回** | [`docs/navigation.md`](./docs/navigation.md) | 改快捷导航开关、拖动安全区、浏览器／Android 返回、美化子页退出前必读 |
+| **悬浮球、全局返回与聊天输入栏收起** | [`docs/navigation.md`](./docs/navigation.md) | 改快捷导航开关、拖动安全区、浏览器／Android 返回、美化子页退出、聊天工具栏外部收起或选图挂载前必读 |
 | **iOS 27 主屏幕顶部白雾 / 状态栏底色** | [`docs/ios-status-bar-edge.md`](./docs/ios-status-bar-edge.md) | 改顶部取色、viewport 或 iOS 门禁前必读；manifest standalone 使用 contain，零安全区不回退 44px，异步高度收缩要重建基线；纯色接合不等于壁纸贯穿 |
 | **3D 小屋 · 布局与功能分区** | [`docs/room3d-layout.md`](./docs/room3d-layout.md) | 设计或重排任何房间/样板房、自动摆家具前必读；先划功能区，再按家具组合摆放，保留连续动线，不能逐件随机找空位；本轮统一黑 × 绿 × 白 |
 | **美化分享码与人工审核** | [`docs/beauty-share.md`](./docs/beauty-share.md) | 改美化投稿、作者身份、分享码领取或 `worker/beauty-share` 前必读；未审文件保持私有，更新通过后才替换已发布指针，仅作者明确授权且已审作品进入公开静态装扮库，未授权旧作不公开 |
+| **ChatApp 装扮、白框与深浅色对比度边界** | [`docs/chat-decoration.md`](./docs/chat-decoration.md) | 改 `.sully-chat-root` 挂载范围、白框选择器、心象/装扮弹窗或深浅色表单控件前必读；弹窗与迷你应用挂载在 `.sully-chat-root` 外并带显式深字/浅底边界，深底 `<select>`／日期时间控件配 `[color-scheme:dark]` 与 `[&_option]`，白框用 `:not(:where(...))` 排除色板点/二维码白底/进度条/`qixi_event_card`/`like520_card` |
 | **角色默认对话 API** | [`docs/character-api.md`](./docs/character-api.md) | 改角色独立 API、API 预设分组或对话模型路由前必读；App 优先，单角色回复才使用角色默认，凭据整套选择 |
 | **Anthropic 原生接口 / Prompt Caching** | [`docs/anthropic-messages.md`](./docs/anthropic-messages.md) | 改 Messages 转换、SSE、缓存或 amsg 原生模型调用前必读；原生端点随整套凭据保存，不新增代理，旧 Worker 先更新并验证能力 |
+| **心象 / 思考摘要与正文分离** | [`docs/thinking-response.md`](./docs/thinking-response.md) | 改 thinking 解析、心象显示或排查思考漏进气泡前必读；只按明确字段和标签分流，不凭语言猜测，空正文不得用思考补齐 |
+| **聊天译文样式 / 外挂字幕** | [`docs/chat-translation.md`](./docs/chat-translation.md) | 改双语展示或字幕定位前必读；默认保留气泡内译文，外挂字幕独立浮层贴原文末行，样式按角色保存 |
 | **ElevenLabs 角色语音** | [`docs/elevenlabs-tts.md`](./docs/elevenlabs-tts.md) | 改 v4 / Turbo 语音、Audio Tags、模型参数或字幕前必读；v4 保留开放式标签，只发送稳定度与相似度，不自动降级 |
 | **角色统计 / 上下文字数与 Token 估算** | [`docs/character-statistics.md`](./docs/character-statistics.md) | 改神经链接角色统计前必读；可读范围不等于实际请求，概率预览不得抽签，宫殿缓存单列 |
+| **API 调用记录 / 用途与云端记账** | [`docs/api-call-log.md`](./docs/api-call-log.md) | 新增 `/chat/completions` 调用点、改 `ApiCallMeta` 归属或云端模型用量回传前必读；显式 `meta` 不混入前台环境角色，推送不回传凭据 |
 | **世界书管线、分组与角色绑定** | [`docs/worldbook-management.md`](./docs/worldbook-management.md) | 新增 App／角色生成请求或改世界书前必读；新入口使用 ContextBuilder.buildCharacterRequest，世界书自动随角色装载；绑定按 ID，库与角色缓存同事务更新 |
 | **协同工作私聊衔接与转发** | [`docs/collaboration-chat-bridge.md`](./docs/collaboration-chat-bridge.md) | 改协同读取 ChatApp 范围或转发消息前必读；每轮读 DB，空范围不回退，多选只发当前窗口 |
 | **开发调试面板 / 开关** | [`docs/dev-debug.md`](./docs/dev-debug.md) | 加 dev-only 开关、加调试日志、排查"角色怎么又不说话了"。含逐步指南 |
