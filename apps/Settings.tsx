@@ -53,7 +53,11 @@ import PushSubscriptionPanel from '../components/settings/PushSubscriptionPanel'
 import ActiveMsgGlobalSettingsModal from '../components/settings/ActiveMsgGlobalSettingsModal';
 import { syncAmsgLlmCredentials, syncAmsgToolConfig, syncAmsgToolConfigAndPrompts } from '../utils/amsgStateSync';
 import { ActiveMsgClient } from '../utils/activeMsgClient';
+import { ActiveMsgStore } from '../utils/activeMsgStore';
+import { AMSG_GLOBAL_CONFIG_EVENT, isAmsg2GloballyEnabled } from '../utils/amsgGlobalGate';
+import { flushAmsg2AfterReenable, setAmsg2GlobalEnabled } from '../utils/amsgGlobalSwitch';
 import VersionInfo from '../components/settings/VersionInfo';
+import SullySupportEntry, { SupportIcon } from '../components/settings/SullySupportEntry';
 import { isPushVapidReady } from '../utils/pushVapid';
 import ApiCallLogModal from '../components/settings/ApiCallLogModal';
 import StorageUsagePanel from '../components/settings/StorageUsagePanel';
@@ -85,6 +89,8 @@ import {
     setFirecrawlApiKey,
     type FirecrawlCreditUsage,
 } from '../utils/firecrawl';
+
+const SullySupportPage = React.lazy(() => import('../components/settings/SullySupportPage'));
 
 // hot_news（news.orz.ai）可选热榜平台。key 必须与 API 的 ?platform= 完全一致。
 const HOTNEWS_PLATFORM_OPTIONS: { key: string; label: string }[] = [
@@ -206,6 +212,14 @@ const flushMcpToolConfigSync = () => {
     if (!mcpToolConfigSyncTimer) return;
     clearTimeout(mcpToolConfigSyncTimer);
     runMcpToolConfigSync();
+};
+
+const cancelMcpToolConfigSync = () => {
+    if (mcpToolConfigSyncTimer) {
+        clearTimeout(mcpToolConfigSyncTimer);
+        mcpToolConfigSyncTimer = null;
+    }
+    pendingMcpToolConfigSync = null;
 };
 
 /**
@@ -569,6 +583,18 @@ const Settings: React.FC = () => {
   const presetDeleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   
   // UI States
+  const [showSupport, setShowSupport] = useState(false);
+  const supportEntryRef = useRef<HTMLButtonElement>(null);
+  const supportWasOpen = useRef(false);
+  useSettingsFocus('support', () => {
+      supportEntryRef.current?.scrollIntoView({ block: 'center' });
+      setShowSupport(true);
+  });
+  useLocalBackHandler(() => { setShowSupport(false); return true; }, 30, showSupport);
+  useEffect(() => {
+      if (!showSupport && supportWasOpen.current) supportEntryRef.current?.focus({ preventScroll: true });
+      supportWasOpen.current = showSupport;
+  }, [showSupport]);
   const [showModelModal, setShowModelModal] = useState(false);
   // 打开模型弹窗那一刻的模型名：点 × 关掉时退回它，只有「确定」/点选列表才算数。
   const modelBeforePickerRef = useRef('');
@@ -771,7 +797,58 @@ const Settings: React.FC = () => {
   const [luckinTesting, setLuckinTesting] = useState(false);
 
   const [showAmsg2Modal, setShowAmsg2Modal] = useState(false);
+  useSettingsFocus('amsg2', () => setShowAmsg2Modal(true));
   const [showAmsgCloudData, setShowAmsgCloudData] = useState(false);
+  const [amsgGlobalConfig, setAmsgGlobalConfig] = useState<{ workerUrl: string; enabled?: boolean; initializedAt?: number } | null>(null);
+  const [amsgGlobalToggling, setAmsgGlobalToggling] = useState(false);
+
+  useEffect(() => {
+      let alive = true;
+      void ActiveMsgStore.getGlobalConfig()
+          .then((cfg) => { if (alive) setAmsgGlobalConfig(cfg); })
+          .catch(() => {});
+      const onGlobalCfg = (ev: Event) => {
+          const detail = (ev as CustomEvent).detail;
+          if (detail) {
+              setAmsgGlobalConfig(detail);
+              // 总开关已落盘为暂停时，立即冲刷 800ms 防抖内的 MCP 改动——syncAmsgToolConfig 在暂停态下
+              // 仅写 localStorage 底账、零网络请求，这样重新开启后不会漏同步。
+              if (!isAmsg2GloballyEnabled(detail)) flushMcpToolConfigSync();
+          }
+      };
+      window.addEventListener(AMSG_GLOBAL_CONFIG_EVENT, onGlobalCfg);
+      return () => {
+          alive = false;
+          window.removeEventListener(AMSG_GLOBAL_CONFIG_EVENT, onGlobalCfg);
+      };
+  }, []);
+
+  const handleToggleAmsg2Global = async (next: boolean) => {
+      if (amsgGlobalToggling) return;
+      setAmsgGlobalToggling(true);
+      try {
+          const result = await setAmsg2GlobalEnabled(next, {
+              characters,
+              userProfile,
+              groups,
+              realtimeConfig,
+              apiConfig,
+          });
+          if (!next) {
+              addToast(
+                  result.cronNotice || '已暂停主动消息 2.0，云端连接与角色配置均已保留。',
+                  result.cronNotice ? 'info' : 'success',
+              );
+          } else {
+              addToast(
+                  result.cronNotice || '已恢复主动消息 2.0。',
+                  result.cronNotice ? 'info' : 'success',
+              );
+          }
+      } finally {
+          setAmsgGlobalToggling(false);
+      }
+  };
   const [exportUserScope, setExportUserScope] = useState<'current' | 'all'>('current');
   /**
    * 备份带不带主动消息 2.0 的后端连接（Worker 地址 + 密钥 + 用户 id），手动导出和云端备份共用。
@@ -1973,7 +2050,7 @@ const Settings: React.FC = () => {
       )}
 
       {/* Header */}
-      <div className="bg-[#fffefe] border-b border-slate-200 shrink-0 z-10 sticky top-0" style={{ paddingTop: 'var(--safe-top)' }}>
+      <div className="bg-[#fffefe] border-b border-slate-200 shrink-0 z-10 sticky top-0" style={{ paddingTop: 'var(--safe-top)' }} {...(showSupport ? { inert: '' } : {})} aria-hidden={showSupport || undefined}>
         <div className="flex items-center px-4 py-3">
         <div className="flex items-center gap-2 w-full">
             <button onClick={closeApp} className="p-2 -ml-2 rounded-full hover:bg-black/5 active:scale-90 transition-transform">
@@ -1986,7 +2063,7 @@ const Settings: React.FC = () => {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-5 space-y-6 no-scrollbar pb-20">
+      <div className="flex-1 overflow-y-auto p-5 space-y-6 no-scrollbar pb-20" {...(showSupport ? { inert: '' } : {})} aria-hidden={showSupport || undefined}>
 
         <NavigationBallSettings characters={characters} loadWorlds={() => DB.getWorlds()} />
         {/* 外观救急入口统一放在设置顶部，无需进入已被错误 CSS 遮住的聊天或日记。 */}
@@ -3246,6 +3323,37 @@ const Settings: React.FC = () => {
             <p className="text-xs text-slate-500 leading-relaxed">
                 角色到点自动给你发消息，App 关着也能收。需要一个属于你自己的 Cloudflare Worker（自带 D1 数据库 + 定时触发），在配置里粘一枚 Token 就能一键部署。聊天上云（即时对话）与定时主动消息都由它承担。
             </p>
+            {amsgGlobalConfig?.workerUrl?.trim() ? (
+                <div className="mt-3 flex items-center justify-between gap-3 rounded-2xl border border-violet-100 bg-white/80 px-4 py-3">
+                    <div className="min-w-0">
+                        <div className="text-xs font-semibold text-slate-700">
+                            总开关 · {isAmsg2GloballyEnabled(amsgGlobalConfig) ? '运行中' : '已暂停'}
+                        </div>
+                        <div className="mt-0.5 text-[11px] leading-relaxed text-slate-500">
+                            {isAmsg2GloballyEnabled(amsgGlobalConfig)
+                                ? '关闭后立即暂停本机所有 Worker 请求、状态同步与即时对话，保留全部连接配置。'
+                                : '已暂停本机所有云端请求，聊天回到本地生成，已有连接与角色配置均保留。'}
+                        </div>
+                    </div>
+                    <button
+                        type="button"
+                        role="switch"
+                        aria-checked={isAmsg2GloballyEnabled(amsgGlobalConfig)}
+                        aria-label="主动消息 2.0 总开关"
+                        disabled={amsgGlobalToggling}
+                        onClick={() => void handleToggleAmsg2Global(!isAmsg2GloballyEnabled(amsgGlobalConfig))}
+                        className={`w-12 h-7 rounded-full transition-colors relative shrink-0 disabled:opacity-50 ${
+                            isAmsg2GloballyEnabled(amsgGlobalConfig) ? 'bg-violet-500' : 'bg-slate-200'
+                        }`}
+                    >
+                        <span
+                            className={`absolute top-0.5 left-0.5 w-6 h-6 bg-white rounded-full shadow transition-all duration-200 ${
+                                isAmsg2GloballyEnabled(amsgGlobalConfig) ? 'translate-x-5' : 'translate-x-0'
+                            }`}
+                        />
+                    </button>
+                </div>
+            ) : null}
             <button type="button" onClick={() => setShowAmsgCloudData(true)} className="mt-3 w-full rounded-2xl border border-violet-100 bg-violet-50/60 px-4 py-3 text-left text-xs text-violet-700">
                 <span className="block font-semibold">云端数据管理</span>
                 <span className="mt-1 block text-[11px] text-slate-500">查看 Worker 实际保存的数据，按项清理或彻底移除角色。</span>
@@ -3361,8 +3469,15 @@ const Settings: React.FC = () => {
         )}
 
         <VersionInfo />
+        <SullySupportEntry ref={supportEntryRef} onOpen={() => setShowSupport(true)} />
 
       </div>
+
+      {showSupport && <React.Suspense fallback={
+          <section className="sully-support support-page" aria-label="打赏 Sully" onKeyDown={event => {
+              if (event.key === 'Escape') { event.stopPropagation(); setShowSupport(false); }
+          }}><div className="support-loading"><header className="support-header"><button autoFocus className="header-back" type="button" onClick={() => setShowSupport(false)} aria-label="返回设置"><SupportIcon name="back" /></button><h1>打赏 Sully</h1><span /></header><p role="status">猫猫正在准备小票…</p></div></section>
+      }><SullySupportPage onClose={() => setShowSupport(false)} /></React.Suspense>}
 
       {/* Cloud Config Modal */}
       <Modal isOpen={showCloudModal} title="云端备份配置" onClose={() => setShowCloudModal(false)}>
@@ -4422,6 +4537,14 @@ const Settings: React.FC = () => {
         realtimeConfig={realtimeConfig}
         onOpenVapid={() => { setShowAmsg2Modal(false); setShowVapidModal(true); }}
         onOpenCloudData={() => { setShowAmsg2Modal(false); setShowAmsgCloudData(true); }}
+        onToggleGlobalEnabled={handleToggleAmsg2Global}
+        onReenabledAfterConnect={() => void flushAmsg2AfterReenable({
+          characters,
+          userProfile,
+          groups,
+          realtimeConfig,
+          apiConfig,
+        })}
       />
       <AmsgCloudDataModal
         isOpen={showAmsgCloudData}
