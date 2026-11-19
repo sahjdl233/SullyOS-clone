@@ -1,11 +1,17 @@
+import { ChatLocationPin } from './ChatLocationPin';
+import { SullyHelpCard } from './SullyHelpCard';
+import { BUILTIN_SULLY_ID } from '../../utils/sullyIdentity';
 import { avatarDecorationImageStyle, isAnniversaryFrame } from '../../utils/anniversaryGifts';
 
 
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import ChatSendProgress from './ChatSendProgress';
+import ChatAvatarTimestamp, { AVATAR_TIMESTAMP_HEIGHT } from './ChatAvatarTimestamp';
+import type { ChatSendPhase } from '../../utils/chatSendProgress';
 import { createPortal } from 'react-dom';
 const AivenFishSaleReceipt = React.lazy(() => import('../../apps/vrWorld/AivenFishSaleReceipt').then(module => ({ default: module.AivenFishSaleReceipt })));
-import { Message, ChatTheme } from '../../types';
+import { Message, ChatTheme, type OSTheme } from '../../types';
 import { phoneFieldToText } from '../../utils/phoneEvidence';
 import { tryParseLifeSimResetCard } from '../../utils/lifeSimChatCard';
 import { VALID_INTERJECTION_TAGS, cleanVoiceMarkupForDisplay } from '../../utils/minimaxTts';
@@ -14,11 +20,13 @@ import { formatStatCount } from '../../utils/videoParser';
 import { buildXhsNoteLink } from '../../utils/xhsNoteLink';
 import { trackEvent } from '../../utils/analytics';
 import { resolveBubbleCornerRadii, shouldHideBubbleTail } from '../../utils/bubbleAppearance';
+import { formatChatTimeDivider, formatChatTimestamp } from '../../utils/chatMessageGrouping';
 import { isReducedBlurActive } from '../../utils/blurPolicy';
 import { isImageValue, useBlobRefUrl } from '../../utils/blobRef';
 import { buildReplySnapshotContent } from '../../utils/applyAssistantPostProcessing';
 import { stripLeakedSourceTags } from '../../utils/sanitize';
 import TokenImg from '../os/TokenImg';
+import EmojiImage from './EmojiImage';
 import ChatImage from './ChatImage';
 import { SARSpeechSwitch } from '../sar/SARSpeechSwitch';
 import McdCard from './McdCard';
@@ -35,6 +43,8 @@ import {FriendFeedNote} from './FriendFeedNote';
 import { ChatTranslationText } from './ChatSubtitleLayer';
 import type { ChatTranslationStyle } from '../../utils/chatTranslationStyle';
 import FriendFeedShareCard from './FriendFeedShareCard';
+import ThinkingActionsMenu from './ThinkingActionsMenu';
+import { readThinkingTranslation, thinkingTranslationPairs, type ThinkingTranslation } from '../../utils/thinkingTranslation';
 // 心象卡片的「破格」装饰：溢出卡片边框的风格化元素。
 // 必须渲染在卡片（overflow-hidden）的兄弟层、且父容器 relative + 不裁剪，才能真的探出边框。
 // 被 ThinkingChainBlock 与设置弹窗的 StylePreview 共用；compact 用于迷你预览缩小尺寸。
@@ -144,20 +154,35 @@ export const ThinkingChainBlock: React.FC<{
     styleId?: ThinkingChainStyleId;
     customColors?: { bg?: string; accent?: string; text?: string };
     onOpenSettings?: () => void;
-}> = ({ chain, styleId, customColors, onOpenSettings, initiallyExpanded=false }) => {
+    translation?: ThinkingTranslation;
+    onTranslate?: () => Promise<ThinkingTranslation>;
+}> = ({ chain, styleId, customColors, onOpenSettings, initiallyExpanded=false, translation, onTranslate }) => {
     const [expanded, setExpanded] = useState(initiallyExpanded);
+    const [actionsOpen, setActionsOpen] = useState(false);
+    const [result, setResult] = useState<ThinkingTranslation>();
+    const [translationView, setTranslationView] = useState<'translation' | 'original' | 'parallel'>('translation');
+    const [translating, setTranslating] = useState(false);
+    const [translationError, setTranslationError] = useState('');
+    const alive = useRef(true);
+    const translationBusy = useRef(false);
     const [copyState, setCopyState] = useState<'idle' | 'ready' | 'ok' | 'error'>('idle');
     const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const pointerIdRef = useRef<number | null>(null);
-    const pointerTypeRef = useRef<React.PointerEvent<HTMLDivElement>['pointerType'] | ''>('');
     const pointerStartRef = useRef({ x: 0, y: 0 });
     const longPressReadyRef = useRef(false);
     const suppressNextClickRef = useRef(false);
     const trimmed = (chain || '').trim();
+    const latestChain = useRef(trimmed);
+    latestChain.current = trimmed;
+    const translatedText = readThinkingTranslation(trimmed, result) || readThinkingTranslation(trimmed, translation);
+    const showingTranslation = !!translatedText && translationView !== 'original';
+    const pairs = useMemo(() => thinkingTranslationPairs(trimmed, readThinkingTranslation(trimmed, result) ? result : translation), [trimmed, result, translation]);
+    const showingParallel = showingTranslation && translationView === 'parallel';
+    const displayedText = showingParallel ? pairs.map(row => row.source + '\n' + row.text).join('\n\n') : (showingTranslation ? translatedText : trimmed) || trimmed;
     const spec = resolveThinkingChainStyle(styleId, customColors);
-    const firstLine = trimmed.replace(/\s+/g, ' ').slice(0, 38);
-    const hasMore = trimmed.length > 38;
+    const firstLine = displayedText.replace(/\s+/g, ' ').slice(0, 38);
+    const hasMore = displayedText.length > 38;
 
     const clearCopyTimer = () => {
         if (copyTimerRef.current) {
@@ -166,10 +191,16 @@ export const ThinkingChainBlock: React.FC<{
         }
     };
 
-    useEffect(() => () => {
-        clearCopyTimer();
-        if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    useEffect(() => {
+        alive.current = true;
+        return () => {
+            alive.current = false;
+            clearCopyTimer();
+            if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+        };
     }, []);
+    useEffect(() => { setTranslationError(''); setTranslating(false); translationBusy.current = false; }, [trimmed]);
+    useEffect(() => { if (!actionsOpen) suppressNextClickRef.current = false; }, [actionsOpen]);
 
     if (!trimmed) return null;
 
@@ -177,14 +208,14 @@ export const ThinkingChainBlock: React.FC<{
         let success = false;
         try {
             if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
-            await navigator.clipboard.writeText(trimmed);
+            await navigator.clipboard.writeText(displayedText);
             success = true;
         } catch {
             // iOS PWA / 非安全上下文可能拒绝 Clipboard API，保留 textarea 兜底。
             let textarea: HTMLTextAreaElement | null = null;
             try {
                 textarea = document.createElement('textarea');
-                textarea.value = trimmed;
+                textarea.value = displayedText;
                 textarea.setAttribute('readonly', '');
                 textarea.style.position = 'fixed';
                 textarea.style.opacity = '0';
@@ -212,20 +243,18 @@ export const ThinkingChainBlock: React.FC<{
         if (copyState === 'ready') setCopyState('idle');
     };
 
-    // 必须由 pointerup / touchend / contextmenu 这类真实用户手势直接调用。
-    // Safari 会拒绝在长按 setTimeout 回调里发起的剪贴板写入。
-    const finishLongPressCopy = () => {
+    const finishLongPress = () => {
         if (!longPressReadyRef.current) return false;
         clearCopyTimer();
         longPressReadyRef.current = false;
         suppressNextClickRef.current = true;
-        void copyThinkingChain();
+        setCopyState('idle');
+        setActionsOpen(true);
         return true;
     };
 
     const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
         e.stopPropagation();
-        pointerTypeRef.current = e.pointerType;
         if (e.button !== 0) return;
         pointerIdRef.current = e.pointerId;
         pointerStartRef.current = { x: e.clientX, y: e.clientY };
@@ -252,7 +281,7 @@ export const ThinkingChainBlock: React.FC<{
         e.stopPropagation();
         if (pointerIdRef.current !== e.pointerId) return;
         pointerIdRef.current = null;
-        if (!finishLongPressCopy()) resetLongPress();
+        if (!finishLongPress()) resetLongPress();
     };
 
     const handlePointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -260,9 +289,25 @@ export const ThinkingChainBlock: React.FC<{
         if (pointerIdRef.current !== e.pointerId) return;
         pointerIdRef.current = null;
         clearCopyTimer();
-        // iOS 弹出原生选区时可能先派发 pointercancel，随后仍会派发 touchend。
-        // 此时保留 ready，让 touchend 仍可在真实用户手势中执行复制。
+        // iOS 长按可能先派发 pointercancel，随后仍会派发 touchend。
         if (e.pointerType !== 'touch' || !longPressReadyRef.current) resetLongPress();
+    };
+
+    const translate = async () => {
+        setActionsOpen(false); setExpanded(true);
+        if (translatedText) { setTranslationView(translationView === 'original' ? 'translation' : 'original'); return; }
+        if (!onTranslate || translationBusy.current) return;
+        const source = trimmed;
+        translationBusy.current = true;
+        setTranslating(true); setTranslationError('');
+        try {
+            const translated = await onTranslate();
+            if (alive.current && latestChain.current === source) { setResult(translated); setTranslationView('translation'); }
+        } catch (error) {
+            if (alive.current && latestChain.current === source) setTranslationError(error instanceof Error ? error.message : '翻译失败，请重试。');
+        } finally {
+            if (alive.current && latestChain.current === source) { setTranslating(false); translationBusy.current = false; }
+        }
     };
 
     const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -278,7 +323,7 @@ export const ThinkingChainBlock: React.FC<{
     const copyStatusLabel = copyState === 'ok'
         ? '已复制'
         : copyState === 'ready'
-            ? '松开复制'
+            ? '松开查看操作'
             : copyState === 'error'
                 ? '请用系统复制'
                 : expanded ? spec.silenceLabel : spec.listenLabel;
@@ -288,8 +333,8 @@ export const ThinkingChainBlock: React.FC<{
             className="sully-psyche relative mb-2 w-full max-w-full select-text cursor-pointer group"
             role="button"
             tabIndex={0}
-            aria-label="心象：点击展开，长按复制全文"
-            title="长按复制心象全文"
+            aria-label="心象：点击展开，长按选择复制或翻译"
+            title="长按选择复制或翻译"
             onClick={handleClick}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
@@ -297,17 +342,18 @@ export const ThinkingChainBlock: React.FC<{
             onPointerCancel={handlePointerCancel}
             onTouchEnd={(e) => {
                 e.stopPropagation();
-                finishLongPressCopy();
+                finishLongPress();
             }}
             onContextMenu={(e) => {
                 e.stopPropagation();
-                // 触屏保留 Safari 原生蓝色选区与复制菜单，作为剪贴板权限受限时的兜底。
-                if (pointerTypeRef.current !== 'mouse') return;
                 e.preventDefault();
+                resetLongPress();
                 suppressNextClickRef.current = false;
-                void copyThinkingChain();
+                setActionsOpen(true);
             }}
             onKeyDown={(e) => {
+                if (e.target !== e.currentTarget) return;
+                if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); setActionsOpen(true); return; }
                 if (e.key !== 'Enter' && e.key !== ' ') return;
                 e.preventDefault();
                 setExpanded(v => !v);
@@ -316,7 +362,7 @@ export const ThinkingChainBlock: React.FC<{
                 touchAction: 'pan-y',
                 userSelect: 'text',
                 WebkitUserSelect: 'text',
-                WebkitTouchCallout: 'default',
+                WebkitTouchCallout: 'none',
             }}
         >
             <div
@@ -389,6 +435,8 @@ export const ThinkingChainBlock: React.FC<{
                     >
                         {copyStatusLabel}
                     </span>
+                    <button type="button" aria-label="心象操作" style={{ color: spec.subtext, background: 'none', border: 0, minWidth: 28, minHeight: 28, padding: 0 }}
+                        onPointerDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); setActionsOpen(true); }}>···</button>
                 </div>
 
                 {/* 装饰横线 */}
@@ -426,13 +474,25 @@ export const ThinkingChainBlock: React.FC<{
                             }}
                             onClick={(e) => e.stopPropagation()}
                         >
-                            {trimmed}
+                            {showingParallel ? <div className="sully-psyche-parallel">{pairs.map((row, index) => <div key={index} className="sully-psyche-parallel-pair">
+                                <p className="sully-psyche-parallel-original">{row.source}</p><p className="sully-psyche-parallel-translation" lang="zh-CN">{row.text}</p>
+                            </div>)}</div> : displayedText}
                         </div>
+                        {(onTranslate || translatedText) && <div className="sully-psyche-translation-tools" style={{ color: spec.subtext }} onPointerDown={event => event.stopPropagation()} onClick={event => event.stopPropagation()}>
+                            {translating ? <span role="status">翻译中…</span> : translatedText ? <div className="sully-psyche-view-switch" role="group" aria-label="心象显示方式">
+                                {([['translation', '译文'], ['original', '原文'], ['parallel', '中英对照']] as const).map(([mode, label]) => <button key={mode} type="button" aria-pressed={translationView === mode} onClick={() => setTranslationView(mode)}>{label}</button>)}
+                            </div> : <span>长按可复制或翻译</span>}
+                            {translationError && <span role="alert" className="sully-psyche-translation-error">{translationError}</span>}
+                        </div>}
                     </div>
                 )}
             </div>
             {/* 破格装饰渲染在卡片外层（卡片自身 overflow-hidden 裁不掉它） */}
             <PsycheDecor spec={spec} />
+            {actionsOpen && <ThinkingActionsMenu translated={showingTranslation} parallel={showingParallel} hasTranslation={!!translatedText} busy={translating}
+                onClose={() => setActionsOpen(false)} onCopy={() => { setActionsOpen(false); void copyThinkingChain(); }}
+                onTranslate={onTranslate || translatedText ? () => { void translate(); } : undefined}
+                onSettings={onOpenSettings ? () => { setActionsOpen(false); onOpenSettings(); } : undefined} />}
         </div>
     );
 };
@@ -459,7 +519,7 @@ const ForwardCard: React.FC<{
         setExpanded(true);
     };
 
-    const formatTime = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    const formatTime = formatChatTimestamp;
 
     return (
         <>
@@ -508,7 +568,7 @@ const ForwardCard: React.FC<{
                                         <div className="text-[10px] text-slate-400 mb-1 px-1">{senderName} {msg.timestamp ? formatTime(msg.timestamp) : ''}</div>
                                         <div className={`px-4 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap break-normal [overflow-wrap:anywhere] ${isUser ? 'bg-primary text-white rounded-br-sm' : 'bg-white text-slate-700 rounded-bl-sm shadow-sm border border-slate-100'}`}>
                                             {msg.type === 'image' ? (msg.content ? <TokenImg value={msg.content} className="max-w-[200px] rounded-xl" /> : <span className="italic opacity-60">[图片已丢失]</span>) :
-                                             msg.type === 'emoji' ? (msg.content ? <TokenImg value={msg.content} className="max-w-[100px]" /> : <span className="italic opacity-60">[表情已丢失]</span>) :
+                                             msg.type === 'emoji' ? (msg.content ? <EmojiImage value={msg.content} className="max-w-[100px]" /> : <span className="italic opacity-60">[表情已丢失]</span>) :
                                              msg.content}
                                         </div>
                                     </div>
@@ -711,23 +771,24 @@ const TransferCard: React.FC<{
                 <div className="sully-chat-transfer-overlay fixed inset-0 z-[100] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6 animate-fade-in" onClick={(e) => { e.stopPropagation(); setOpen(false); }}>
                     <div
                         className="sully-chat-transfer-dialog w-full max-w-[320px] bg-white text-slate-800 rounded-3xl overflow-hidden shadow-2xl"
+                        role="dialog" aria-modal="true" aria-label="转账详情"
                         onClick={(e) => e.stopPropagation()}
                     >
                         {/* 顶部金额区 */}
-                        <div className="bg-gradient-to-br from-amber-400 to-orange-500 px-6 pt-7 pb-8 text-white relative overflow-hidden">
+                        <div className="sully-chat-transfer-detail-header bg-gradient-to-br from-amber-400 to-orange-500 px-6 pt-7 pb-8 text-white relative overflow-hidden">
                             <div className="absolute -top-4 -right-4 opacity-15"><SullyPayMark className="w-28 h-28" /></div>
                             <div className="flex items-center gap-2 mb-5">
                                 <div className="p-1.5 bg-white/20 rounded-full"><SullyPayMark className="w-4 h-4" /></div>
                                 <span className="text-sm font-medium text-white/90">Sully Pay 转账</span>
                             </div>
                             <div className="text-[11px] text-white/70 mb-1">{isUser ? `你向${charName}转账` : `${charName}向你转账`}</div>
-                            <div className="text-4xl font-bold tracking-tight">₩ {amount}</div>
+                            <div className="sully-chat-transfer-detail-amount text-4xl font-bold tracking-tight">₩ {amount}</div>
                         </div>
 
                         {/* 详情区 */}
-                        <div className="px-6 py-5 space-y-3.5">
+                        <div className="sully-chat-transfer-detail-body px-6 py-5 space-y-3.5">
                             {note && (
-                                <div className="bg-slate-50 rounded-xl px-3.5 py-2.5">
+                                <div className="sully-chat-transfer-detail-note bg-slate-50 rounded-xl px-3.5 py-2.5">
                                     <div className="text-[10px] text-slate-400 mb-0.5">转账留言</div>
                                     <div className="text-sm text-slate-700 break-words">{note}</div>
                                 </div>
@@ -1105,7 +1166,9 @@ interface MessageItemProps {
     isLastInGroup: boolean;
     activeTheme: ChatTheme;
     charAvatar: string;
+    onOpenCharacterProfile?: () => void;
     charName: string;
+    locationPinCharId?: string;
     userAvatar: string;
     /** 当前窗口里的最后一条消息；最新图片需要立即解码，避免移动端懒加载卡在滚动容器底部。 */
     isLatestMessage?: boolean;
@@ -1137,6 +1200,12 @@ interface MessageItemProps {
     bubbleVariant?: 'modern' | 'flat' | 'outline' | 'shadow' | 'wechat' | 'ios';
     messageSpacing?: 'compact' | 'default' | 'spacious';
     showTimestamp?: 'always' | 'hover' | 'never';
+    timestampPosition?: OSTheme['chatTimestampPosition'];
+    avatarPlacement?: OSTheme['chatAvatarPlacement'];
+    startsTimeSegment?: boolean;
+    timestampNow?: Date;
+    /** Only the user turn being handed to the Worker receives this prop. */
+    sendPhase?: ChatSendPhase;
     /** HTML / 心象 / 音乐卡片的出现位置（聊天细节微调 chatModuleAlign 合并后的生效值）。缺省 = 居中 */
     moduleAlign?: 'anchor' | 'center';
     /** 流式预览无缝接棒时，正式消息首帧已经可见，不应再次从透明态淡入。 */
@@ -1158,6 +1227,7 @@ interface MessageItemProps {
         styleId?: ThinkingChainStyleId;
         customColors?: { bg?: string; accent?: string; text?: string };
         onOpenSettings?: () => void;
+        onTranslate?: (message: Message) => Promise<ThinkingTranslation>;
     };
 }
 
@@ -1169,7 +1239,9 @@ const MessageItem = React.memo(({
     isLastInGroup,
     activeTheme,
     charAvatar,
+    onOpenCharacterProfile,
     charName,
+    locationPinCharId,
     userAvatar,
     isLatestMessage = false,
     onMediaLoad,
@@ -1195,6 +1267,11 @@ const MessageItem = React.memo(({
     bubbleVariant = 'modern',
     messageSpacing = 'default',
     showTimestamp = 'always',
+    timestampPosition = 'below',
+    avatarPlacement = 'beside',
+    startsTimeSegment = false,
+    timestampNow,
+    sendPhase,
     moduleAlign = 'center',
     suppressEntranceAnimation = false,
     onMcdSendCart,
@@ -1207,9 +1284,15 @@ const MessageItem = React.memo(({
     thinkingChainOptions,
 }: MessageItemProps) => {
     const isUser = m.role === 'user';
+    const showSendProgress = isUser && !selectionMode && !!sendPhase && sendPhase !== 'accepted' && sendPhase !== 'cancelled';
     const isSystem = m.role === 'system';
-    const spacingClass = messageSpacing === 'compact' ? (isLastInGroup ? 'mb-3' : 'mb-0.5') : messageSpacing === 'spacious' ? (isLastInGroup ? 'mb-8' : 'mb-2.5') : (isLastInGroup ? 'mb-6' : 'mb-1.5');
-    const marginBottom = spacingClass;
+    const groupBottomGap = timestampPosition === 'top_center'
+        ? (messageSpacing === 'compact' ? 'mb-2.5' : messageSpacing === 'spacious' ? 'mb-6' : 'mb-3.5')
+        : (messageSpacing === 'compact' ? 'mb-3' : messageSpacing === 'spacious' ? 'mb-8' : 'mb-6');
+    const spacingClass = isLastInGroup
+        ? groupBottomGap
+        : (messageSpacing === 'compact' ? 'mb-0.5' : messageSpacing === 'spacious' ? 'mb-2.5' : 'mb-1.5');
+    const marginBottom = showSendProgress && (timestampPosition === 'top_center' || !isLastInGroup) ? 'mb-5' : spacingClass;
     const avatarSizeClass = avatarSize === 'small' ? 'w-7 h-7' : avatarSize === 'large' ? 'w-12 h-12' : 'w-9 h-9';
     const avatarRadiusClass = avatarShape === 'square' ? 'rounded-sm' : avatarShape === 'rounded' ? 'rounded-xl' : 'rounded-full';
     const avatarSizePx = avatarSize === 'small' ? 28 : avatarSize === 'large' ? 48 : 36;
@@ -1346,37 +1429,54 @@ const MessageItem = React.memo(({
         onClick: handleClick
     };
 
-    const formatTime = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    const formatTime = formatChatTimestamp;
+    const showTopTimeDivider = timestampPosition === 'top_center' && startsTimeSegment && showTimestamp !== 'never';
+    const showBelowTimestamp = timestampPosition === 'below' && isLastInGroup && showTimestamp !== 'never';
+    const showAvatarTime = timestampPosition === 'below_avatar' && showTimestamp !== 'never';
+    const isWechatTopCapsule = bubbleVariant === 'wechat';
+    const timeDividerNode = showTopTimeDivider ? (
+        <div className={`sully-chat-time-divider flex justify-center w-full px-3 mt-1.5 mb-3 select-none ${showTimestamp === 'hover' ? 'opacity-0 hover:opacity-100 transition-opacity' : ''}`}>
+            <span className={`sully-chat-timestamp text-[11px] leading-tight font-normal whitespace-nowrap ${isWechatTopCapsule ? 'bg-black/[0.05] text-[#7f7f7f] px-2.5 py-[3px] rounded-[4px]' : 'text-slate-400 px-2 py-0.5 rounded-md'}`}>
+                {formatChatTimeDivider(m.timestamp, timestampNow)}
+            </span>
+        </div>
+    ) : null;
 
     // Render Avatar with potential decoration/frame
     // Removed mb-5 from here, handled via absolute positioning in parent
-    const renderAvatar = (
-        src: string,
-        options?: { visible?: boolean; className?: string },
-    ) => {
-        const visible = options?.visible ?? shouldShowAvatar;
+    const renderAvatar = (src: string, turnAvatar = false) => {
+        const visible = turnAvatar || shouldShowAvatar;
+        const hasCaption = showAvatarTime && visible && turnAvatar === (avatarPlacement === 'above_group');
+        const opensProfile = visible && !isUser && !selectionMode && !!onOpenCharacterProfile;
+        const Wrap = opensProfile ? 'button' : 'div';
         return (
-            <div className={`${visible ? 'sully-chat-avatar-wrap' : ''} relative ${avatarSizeClass} z-0 ${options?.className || ''}`}>
-                {visible && (
-                    <>
-                        <TokenImg
-                            value={src}
-                            style={isAnniversaryFrame(styleConfig.avatarDecoration) ? { borderRadius: "50%" } : undefined}
-                            className={`sully-chat-message-avatar-img w-full h-full ${avatarRadiusClass} object-cover shadow-sm ring-1 ring-black/5 relative z-0`}
-                            alt="avatar"
-                            loading="lazy"
-                            decoding="async"
-                        />
-                        {styleConfig.avatarDecoration && (
+            <>
+                <Wrap type={opensProfile ? 'button' : undefined}
+                    aria-label={opensProfile ? `查看${charName}的角色名片` : undefined}
+                    onClick={opensProfile ? (event: React.MouseEvent) => { event.stopPropagation(); onOpenCharacterProfile?.(); } : undefined}
+                    className={`${visible ? 'sully-chat-avatar-wrap' : ''} ${hasCaption ? 'block' : ''} relative ${avatarSizeClass} z-0 ${turnAvatar ? 'sully-chat-turn-avatar' : 'sully-chat-message-avatar'}`}>
+                    {visible && (
+                        <>
                             <TokenImg
-                                value={styleConfig.avatarDecoration}
-                                className="sully-chat-avatar-frame absolute pointer-events-none z-10 max-w-none"
-                                style={avatarDecorationImageStyle(styleConfig, avatarSizePx)}
+                                value={src}
+                                style={isAnniversaryFrame(styleConfig.avatarDecoration) ? { borderRadius: "50%" } : undefined}
+                                className={`sully-chat-message-avatar-img w-full h-full ${avatarRadiusClass} object-cover shadow-sm ring-1 ring-black/5 relative z-0`}
+                                alt="avatar"
+                                loading="lazy"
+                                decoding="async"
                             />
-                        )}
-                    </>
-                )}
-            </div>
+                            {styleConfig.avatarDecoration && (
+                                <TokenImg
+                                    value={styleConfig.avatarDecoration}
+                                    className="sully-chat-avatar-frame absolute pointer-events-none z-10 max-w-none"
+                                    style={avatarDecorationImageStyle(styleConfig, avatarSizePx)}
+                                />
+                            )}
+                        </>
+                    )}
+                </Wrap>
+                {hasCaption && <ChatAvatarTimestamp timestamp={m.timestamp} hover={showTimestamp === 'hover'} />}
+            </>
         );
     };
 
@@ -1611,24 +1711,29 @@ const MessageItem = React.memo(({
 
     if (m.type === 'interaction') {
         return (
-            <div className={`flex flex-col items-center ${marginBottom} w-full animate-fade-in relative transition-[padding] duration-300 ${selectionMode ? 'pl-8' : ''}`}>
-                {selectionMode && (
-                    <div className="absolute left-2 top-1/2 -translate-y-1/2 cursor-pointer z-20" onClick={() => onToggleSelect(m.id)}>
-                        <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${isSelected ? 'bg-primary border-primary' : 'border-slate-300 bg-white/80'}`}>
-                            {isSelected && <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={3} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>}
+            <>
+                {timeDividerNode}
+                <div className={`flex flex-col items-center ${marginBottom} w-full animate-fade-in relative transition-[padding] duration-300 ${selectionMode ? 'pl-8' : ''}`}>
+                    {selectionMode && (
+                        <div className="absolute left-2 top-1/2 -translate-y-1/2 cursor-pointer z-20" onClick={() => onToggleSelect(m.id)}>
+                            <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${isSelected ? 'bg-primary border-primary' : 'border-slate-300 bg-white/80'}`}>
+                                {isSelected && <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={3} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>}
+                            </div>
+                        </div>
+                    )}
+                    {timestampPosition === 'below' && showTimestamp !== 'never' && (
+                        <div className={`sully-chat-timestamp text-[10px] text-slate-400 mb-1 opacity-70 ${showTimestamp === 'hover' ? 'opacity-0 hover:opacity-100 transition-opacity' : ''}`}>{formatTime(m.timestamp)}</div>
+                    )}
+                    <div className="group relative cursor-pointer active:scale-95 transition-transform" {...interactionProps}>
+                            <div className="sully-chat-poke text-[11px] text-slate-500 bg-white/60 bg-slate-200/50 backdrop-blur-sm px-4 py-1.5 rounded-full flex items-center gap-1.5 border border-slate-200/70 border-white/40 shadow-sm select-none">
+                            <img src="https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/1f449.png" alt="poke" className="w-4 h-4 group-hover:animate-bounce" />
+                            <span className="font-medium opacity-80">{isUser ? '你' : charName}</span>
+                            <span className="opacity-60">戳了戳</span>
+                            <span className="font-medium opacity-80">{isUser ? charName : '你'}</span>
                         </div>
                     </div>
-                )}
-                <div className="text-[10px] text-slate-400 mb-1 opacity-70">{formatTime(m.timestamp)}</div>
-                <div className="group relative cursor-pointer active:scale-95 transition-transform" {...interactionProps}>
-                        <div className="sully-chat-poke text-[11px] text-slate-500 bg-white/60 bg-slate-200/50 backdrop-blur-sm px-4 py-1.5 rounded-full flex items-center gap-1.5 border border-slate-200/70 border-white/40 shadow-sm select-none">
-                        <img src="https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/1f449.png" alt="poke" className="w-4 h-4 group-hover:animate-bounce" />
-                        <span className="font-medium opacity-80">{isUser ? '你' : charName}</span>
-                        <span className="opacity-60">戳了戳</span>
-                        <span className="font-medium opacity-80">{isUser ? charName : '你'}</span>
-                    </div>
                 </div>
-            </div>
+            </>
         );
     }
 
@@ -1662,12 +1767,15 @@ const MessageItem = React.memo(({
                     styleId={thinkingChainOptions?.styleId}
                     customColors={thinkingChainOptions?.customColors}
                     onOpenSettings={thinkingChainOptions?.onOpenSettings}
+                    translation={m.metadata?.thinkingChainTranslation}
+                    onTranslate={thinkingChainOptions?.onTranslate ? () => thinkingChainOptions.onTranslate!(m) : undefined}
                 />
             </div>
         </div>
     ) : null;
     const commonLayout = (content: React.ReactNode) => (
         <>
+            {timeDividerNode}
             {centerModules && thinkingChainNode && (
                 <div className="px-3 flex justify-center">
                     <div className="w-[72%] max-w-[72%]">{thinkingChainNode}</div>
@@ -1684,7 +1792,12 @@ const MessageItem = React.memo(({
                 `flex items-end ${marginBottom} px-3 group select-none relative transition-[padding] duration-300`,
                 selectionMode ? 'pl-12' : '',
             ].filter(Boolean).join(' ')}
-            style={{ '--sully-chat-message-avatar-size': `${avatarSizePx}px` } as React.CSSProperties}>
+            style={{
+                ...(locationPinCharId ? { marginBottom: 18 } : {}),
+                '--sully-chat-message-avatar-size': `${avatarSizePx}px`,
+                '--sully-chat-avatar-time-space': showAvatarTime ? `${AVATAR_TIMESTAMP_HEIGHT}px` : undefined,
+                minHeight: showAvatarTime && shouldShowAvatar && !isModuleCard && avatarPlacement === 'beside' ? avatarSizePx + AVATAR_TIMESTAMP_HEIGHT : undefined,
+            } as React.CSSProperties}>
                 {selectionMode && (
                     <div className="absolute left-3 top-1/2 -translate-y-1/2 cursor-pointer z-20" onClick={() => onToggleSelect(m.id)}>
                         <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${isSelected ? 'bg-primary border-primary' : 'border-slate-300 bg-white/80'}`}>
@@ -1696,17 +1809,14 @@ const MessageItem = React.memo(({
                 {/* 白框布局钩子：组首额外挂一份默认隐藏的头像；显示它即可做“每轮一次、头像在气泡上方”。 */}
                 {isFirstInGroup && !isModuleCard && (
                     <div className={`sully-chat-turn-avatar-slot hidden absolute top-0 z-0 ${isUser ? 'right-3' : (selectionMode ? 'left-14' : 'left-3')}`}>
-                        {renderAvatar(isUser ? userAvatar : charAvatar, {
-                            visible: true,
-                            className: 'sully-chat-turn-avatar',
-                        })}
+                        {renderAvatar(isUser ? userAvatar : charAvatar, true)}
                     </div>
                 )}
 
                 {/* HTML / 音乐卡片是独立模块，不继承普通消息外壳的角色头像。卡片内部自己的头像不受影响。 */}
                 {!isUser && !isModuleCard && (
                     <div className={`sully-chat-message-avatar-slot absolute bottom-0 z-0 ${selectionMode ? 'left-14' : 'left-3'} transition-[left] duration-300`}>
-                        {renderAvatar(charAvatar, { className: 'sully-chat-message-avatar' })}
+                        {renderAvatar(charAvatar)}
                     </div>
                 )}
 
@@ -1745,8 +1855,15 @@ const MessageItem = React.memo(({
                     <div className={selectionMode ? 'pointer-events-none' : ''}>
                         {<ChatCardSurface message={m}>{content}</ChatCardSurface>}
                     </div>
-                    {isLastInGroup && showTimestamp !== 'never' && (
-                        <div className={`absolute top-full ${isUser ? 'right-0' : 'left-0'} mt-0.5 px-1 text-[9px] text-slate-400/80 font-medium whitespace-nowrap pointer-events-none ${showTimestamp === 'hover' ? 'opacity-0 group-hover:opacity-100 transition-opacity' : ''}`}>{formatTime(m.timestamp)}</div>
+                    {(showSendProgress || showBelowTimestamp) && (
+                        <div className={`sully-chat-timestamp-slot absolute top-full ${isUser ? 'right-0' : 'left-0'} mt-0.5 px-1 flex items-center gap-1 text-[9px] text-slate-400/80 font-medium whitespace-nowrap pointer-events-none`}>
+                            {showSendProgress && <ChatSendProgress phase={sendPhase!} />}
+                            {showBelowTimestamp && (
+                                <span className={`sully-chat-timestamp ${showTimestamp === 'hover' ? 'opacity-0 group-hover:opacity-100 transition-opacity' : ''}`}>
+                                    {formatTime(m.timestamp)}
+                                </span>
+                            )}
+                        </div>
                     )}
                     </div>
                 </div>
@@ -1754,7 +1871,8 @@ const MessageItem = React.memo(({
                 {/* 用户侧若存在导入/历史模块卡，也保持同一条“卡片不带消息外侧头像”规则。 */}
                 {isUser && !isModuleCard && (
                     <div className={`sully-chat-message-avatar-slot absolute right-3 bottom-0 z-0 transition-[left] duration-300`}>
-                        {renderAvatar(userAvatar, { className: 'sully-chat-message-avatar' })}
+                        {renderAvatar(userAvatar)}
+                        {locationPinCharId && <ChatLocationPin charId={locationPinCharId} />}
                     </div>
                 )}
             </div>
@@ -1772,6 +1890,10 @@ const MessageItem = React.memo(({
     }
 
     // --- Music Card Rendering (一起听 / 加入歌单) ---
+    if (m.type === 'sully_help_card' && m.role === 'assistant' && m.charId === BUILTIN_SULLY_ID) {
+        return commonLayout(<SullyHelpCard />);
+    }
+
     if (m.type === 'music_card' && m.metadata?.song) {
         const song = m.metadata.song as { songId: number; name: string; artists: string; albumPic: string };
         const intent = (m.metadata.intent || 'join') as 'join' | 'add' | 'join_and_add';
@@ -3125,7 +3247,7 @@ const MessageItem = React.memo(({
     if (m.type === 'emoji') {
         return commonLayout(
             m.content ? (
-                <TokenImg value={m.content} className="sully-emoji-msg max-w-[var(--sully-emoji-size,96px)] max-h-[var(--sully-emoji-size,96px)] w-auto h-auto object-contain hover:scale-105 transition-transform drop-shadow-md active:scale-95" loading="lazy" decoding="async" />
+                <EmojiImage value={m.content} className="sully-emoji-msg max-w-[var(--sully-emoji-size,96px)] max-h-[var(--sully-emoji-size,96px)] w-auto h-auto object-contain hover:scale-105 transition-transform drop-shadow-md active:scale-95" loading="lazy" decoding="async" />
             ) : (
                 <div className="px-3 py-2 rounded-2xl bg-slate-100 text-slate-400 text-xs italic">[表情已丢失]</div>
             )
@@ -3653,12 +3775,19 @@ const MessageItem = React.memo(({
            prev.msg.metadata?.reviewStatus === next.msg.metadata?.reviewStatus &&
            prev.msg.metadata?.status === next.msg.metadata?.status &&
            prev.msg.metadata?.receipt === next.msg.metadata?.receipt &&
+           prev.msg.metadata?.thinkingChain === next.msg.metadata?.thinkingChain &&
+           prev.msg.metadata?.thinkingChainTranslation?.source === next.msg.metadata?.thinkingChainTranslation?.source &&
+           prev.msg.metadata?.thinkingChainTranslation?.text === next.msg.metadata?.thinkingChainTranslation?.text &&
+           prev.msg.metadata?.thinkingChainTranslation?.segments === next.msg.metadata?.thinkingChainTranslation?.segments &&
+           prev.thinkingChainOptions === next.thinkingChainOptions &&
            prev.msg.metadata?.sarModuleSurface?.surface === next.msg.metadata?.sarModuleSurface?.surface &&
            prev.isFirstInGroup === next.isFirstInGroup &&
            prev.isLastInGroup === next.isLastInGroup &&
            prev.activeTheme === next.activeTheme &&
            prev.charAvatar === next.charAvatar &&
+           prev.onOpenCharacterProfile === next.onOpenCharacterProfile &&
            prev.charName === next.charName &&
+           prev.locationPinCharId === next.locationPinCharId &&
            prev.userAvatar === next.userAvatar &&
            prev.isLatestMessage === next.isLatestMessage &&
            prev.onMediaLoad === next.onMediaLoad &&
@@ -3674,6 +3803,11 @@ const MessageItem = React.memo(({
            prev.bubbleVariant === next.bubbleVariant &&
            prev.messageSpacing === next.messageSpacing &&
            prev.showTimestamp === next.showTimestamp &&
+           prev.avatarPlacement === next.avatarPlacement &&
+           prev.timestampPosition === next.timestampPosition &&
+           prev.startsTimeSegment === next.startsTimeSegment &&
+           prev.timestampNow?.getTime() === next.timestampNow?.getTime() &&
+           prev.sendPhase === next.sendPhase &&
            prev.moduleAlign === next.moduleAlign &&
            prev.previewExpanded === next.previewExpanded &&
            prev.previewTransferOpen === next.previewTransferOpen &&

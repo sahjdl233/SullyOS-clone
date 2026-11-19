@@ -1,4 +1,5 @@
 import { diagnosticRunId } from './amsgReproduction';
+import { subscribePageForeground } from './pageForeground';
 import { listUserSpaces } from './userSpaces';
 import { recordDiagnosticInbox } from './amsgReproductionStore';
 import { createReplyRun, isReplyStopped, withReplyCancellation, type ReplyRun } from './chatReplyCancellation';
@@ -138,7 +139,7 @@ const loadApiConfigFromLocalStorage = (): APIConfig => {
 
 /** 从 localStorage 读 RealtimeConfig — 整个 push 路径里我们不会再回连 LLM, 但 ChatParser
  *  及 DIARY 写入(可执行的副作用)需要这些配置, 缺失时返回 undefined 让消费方走 fallback。 */
-const loadRealtimeConfigFromLocalStorage = (): RealtimeConfig | undefined => {
+export const loadRealtimeConfigFromLocalStorage = (): RealtimeConfig | undefined => {
   const raw = (() => {
     try {
       return localStorage.getItem('os_realtime_config');
@@ -1659,8 +1660,12 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger, charId?: string): Pro
       continue;
     }
     if (isReplyStopped(message.taskUuid)) {
-      if (message.taskUuid && (message.metadata as any)?.amsgUsage) {
-        settleInstantChatApiLog(message.taskUuid, message.metadata);
+      if (message.taskUuid && ((message.metadata as any)?.amsgUsage || (message.metadata as any)?.amsgModelCalls)) {
+        try { await settleInstantChatApiLog(message.taskUuid, message.metadata); }
+        catch {
+          retainedInboxMessageIds.add(message.messageId);
+          try { await ActiveMsgStore.saveInboxMessage(message); } catch { /* 下次补收重试记账 */ }
+        }
       }
       continue;
     }
@@ -1678,6 +1683,11 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger, charId?: string): Pro
     // 聊天记录、也没回到收件箱——用户那边只看到「正在输入…」一直亮到 60s 点名判失败，
     // 角色的回复彻底消失。所以整段都得包住，不能只包后处理那一小截。
     try {
+      // Usage must survive reloads, cancellation and replay of an already persisted chat bubble.
+      // The Worker only attaches model-call records to the final segment; commit before message dedup.
+      if (isInstantReply && message.taskUuid && (message.metadata as any)?.amsgModelCalls) {
+        await settleInstantChatApiLog(message.taskUuid, message.metadata);
+      }
       // 'active-msg-received' 事件里的 sentAt 维持原口径（发送时刻优先）：
       // 它只喂 toast / 未读预览，不进聊天记录，别跟落库口径搅在一起。
       const eventSentAt = message.sentAt || message.receivedAt || Date.now();
@@ -1950,7 +1960,9 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger, charId?: string): Pro
           scheduleNextInstantChatStatusCheck();
           // 「API 调用记录」里那笔（发出去时记的）在这里补完：用量挂在末条推送上，
           // 而这里正好是认末段的地方。
-          settleInstantChatApiLog(pendingForChar.uuid, message.metadata as Record<string, any> | null);
+          if (!(message.metadata as any)?.amsgModelCalls) {
+            await settleInstantChatApiLog(pendingForChar.uuid, message.metadata as Record<string, any> | null);
+          }
           // 随这一轮上云的「任务被作废」回执到这里才真的销账。发出时（worker 回 202）
           // 只是记账：202 仅表示受理，那一轮要是整个失败了，回执得留着下轮重新注入，
           // 否则角色永远不知道自己许过的那条排程已经没了。认 uuid，上一轮迟到的结论
@@ -2969,8 +2981,6 @@ export const ActiveMsgRuntime = {
         // 而只记「回来了」的话，前面那段空白到底是页面没在跑、还是在跑但没人喊它，
         // 事后分不出来。
         activeMsgTrace('runtime-page-visibility', { state: document.visibilityState });
-        if (document.visibilityState !== 'visible') return;
-        handlePageBecameVisible();
       });
       // 冷启动那一下（点通知才把 App 拉起来）没有 visibilitychange 可听，这里补一次：
       // 不补的话「回到前台的时刻」一直是 0，从通知进来的第一条判不出「送达时人不在」。
@@ -2990,15 +3000,11 @@ export const ActiveMsgRuntime = {
       });
     }
 
-    // 页面「刚活过来」的那一下，立刻数一眼收件箱，不用干等守望的下一跳。
-    // pageshow：iOS 把 App 挂起后恢复、以及 bfcache 前进/后退时会发，而 visibilitychange
-    //   不一定发——线上记录里就有「只见进后台、不见回前台」的断档。
-    // focus：切回窗口或标签页。
-    // 这两个可能跟 visibilitychange 撞在一起重复触发，但收件箱是「取出即删」、冲刷又都
-    // 走同一条串行链，重复最多是多数一次个数，不会把同一条消息演两遍。
-    if (typeof window !== 'undefined') {
-      window.addEventListener('pageshow', () => { void sweepLocalInbox(); });
-      window.addEventListener('focus', () => { void sweepLocalInbox(); });
+    // Every resume signal uses the same local + cloud catch-up. Only checking the local
+    // inbox misses third-party deliveries whose bodies are still in the Worker outbox.
+    // The subscription coalesces bursts; existing outbox throttling and dedup stay in force.
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      subscribePageForeground(handlePageBecameVisible);
     }
 
     // 受理一轮即时对话之后（useChatAI 那边写记录 + 广播），把点名周期排上。

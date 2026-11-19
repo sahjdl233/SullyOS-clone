@@ -31,6 +31,7 @@ import { buildToolResultMessage, normalizeToolCallsForCompat, toolTurnContinuati
 import { toolCallFingerprint } from '../utils/agenticToolFeedback';
 import { buildChatRequestPayload } from '../utils/chatRequestPayload';
 import { acquireChatReply, isChatReplyActive, subscribeChatReplies } from '../utils/chatReplyLock';
+import { beginChatSendProgress } from '../utils/chatSendProgress';
 import { prepareInboxBeforeChat } from '../utils/activeMsgRuntime';
 import { hasUnansweredUserTurn, withChatContinuation } from '../utils/chatContinuation';
 import { assertChatHasDialogue } from '../utils/chatRequestGuard';
@@ -501,7 +502,7 @@ interface UseChatAIProps {
     categories: EmojiCategory[];
     addToast: (msg: string, type: 'info'|'success'|'error') => void;
     /** 长报错走弹窗 (toast 一行装不下), 手机用户能看清并复制反馈 */
-    showError?: (title: string, details: string) => void;
+    showError?: (title: string, details: string, endpoint?: {baseUrl:string; model:string}) => void;
     setMessages: (msgs: Message[]) => void; // Callback to update UI messages
     /** 正式消息接替流式预览前同步登记 id，避免真实气泡重新播放入场动画。 */
     onStreamPreviewHandover?: (charId: string, messageIds: number[]) => void;
@@ -690,6 +691,11 @@ export const useChatAI = ({
         const releaseReply = acquireChatReply(char.id);
         if (!releaseReply) return;
         const replyRun = createReplyRun(char.id);
+        const sendAnchor = currentMsgs.at(-1);
+        const sendProgress = beginChatSendProgress(char.id,
+            sendAnchor?.role === 'user' && typeof sendAnchor.id === 'number' ? sendAnchor.id : null);
+        const cancelSendProgress = () => sendProgress.cancelled();
+        replyRun.signal.addEventListener('abort', cancelSendProgress, { once: true });
         amsg2Session.signal = replyRun.signal;
         const replyStep = <T>(operation: () => Promise<T>) => withReplyCancellation(replyRun, operation);
         setLocalTyping(true);
@@ -942,6 +948,7 @@ export const useChatAI = ({
                 charId: char.id,
                 reason: instantChatRoute ? null : (instantChatReadiness.reason ?? instantChatVeto),
             });
+            if (!instantChatRoute) sendProgress.local(!!instantChatVeto || !['disabled', 'char-disabled'].includes(instantChatReadiness.reason ?? ''));
 
             const payload = await replyStep(async () => stageT('payload', buildChatRequestPayload({
                 char: charForGen, userProfile, groups, emojis, categories,
@@ -1314,6 +1321,7 @@ export const useChatAI = ({
                     historyMsgs: contextMsgs,
                     reroll: skipEmotionInjection,
                 });
+                sendProgress.sending();
                 const instantChatResult = await replyStep(async () => sendInstantChatTurn({
                     signal: replyRun.signal,
                     char,
@@ -1346,6 +1354,8 @@ export const useChatAI = ({
                         }
                         : {}),
                     userProfile, groups, realtimeConfig,
+                    // 随行的云端快照复用这一轮刚算好的召回，发送前不再多等一轮向量检索。
+                    ...(payload.palaceRecall ? { palaceRecall: payload.palaceRecall } : {}),
                     // 情绪评估也交给云端：worker 到点和主回复并行跑，结果随最后一条推送回来
                     // （见 worker/amsg/src/emotionEval.ts）。放在这里而不是本地 fire 一枪，
                     // 是因为用户发完就能关页面——留在本地的话，页面一关情绪底色就停更了。
@@ -1356,6 +1366,8 @@ export const useChatAI = ({
                     ...(amsgSarSnapshot ? { sarModule: amsgSarSnapshot } : {}),
                 }));
                 if (instantChatResult.ok) {
+                    // sendInstantChatTurn only succeeds after a valid 202 + task UUID.
+                    sendProgress.accepted();
                     // 这次 POST 已经把权威的那份 fire_pack 传上去了，收尾不必再打脏重传一遍。
                     instantChatAccepted = true;
                     // 202 只说明云端收下了，不说明角色真的读到过这些回执：那一轮可能空输出被
@@ -1369,6 +1381,7 @@ export const useChatAI = ({
                     }
                     if(friendFeedMainTask && instantChatResult.uuid)await stageFriendFeedCloudTask(char.id,friendFeedMainTask.id,instantChatResult.uuid).catch(()=>{});
                 } else {
+                    sendProgress.failed();
                     // 没发出去就是没发出去：明确落一条系统消息 + 弹错，用户可以直接重发。
                     // **绝不静默退回本地生成** —— 静默分流那种查无可查的坑踩过一次就够了。
                     const reason = instantChatResult.error || '未知错误';
@@ -2206,10 +2219,14 @@ export const useChatAI = ({
             if(friendFeedMainTask)await acknowledgeFriendFeedNotices(char.id,friendFeedMainTask.id).catch(()=>{});
 
         } catch (e: any) {
+            if (!replyRun.signal.aborted) sendProgress.failed();
             if (replyRun.signal.aborted) return;
             // 注意: 这个 catch 兜的是「拿到 API 响应之后」的整条后处理管线 (applyAssistantPostProcessing,
             // 13 步)。这里抛错多半不是网络问题, 而是解析/正则/落库异常。别再叫"连接中断"误导排查。
             const errMsg = e?.message || String(e);
+            if (showError && /API Error \d{3}|Failed to fetch|API返回了|输出被截断|模型.*格式不正确/i.test(errMsg)) {
+                showError('聊天回复失败', errMsg, effectiveApi);
+            }
             // 瑞一杯模式下报错: 大概率是聊天模型/中转不支持 function calling(tools) → 带 tools 一发就 400。
             // 在 APK 里看不到控制台, 这里把完整原因 + 解法存成可读消息, 方便排查。
             if (luckinChatRef?.current?.active && /\b400\b|tool|function[_\s-]?call/i.test(errMsg)) {
@@ -2222,6 +2239,8 @@ export const useChatAI = ({
             }
             setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
         } finally {
+            replyRun.signal.removeEventListener('abort', cancelSendProgress);
+            sendProgress.finish(replyRun.signal.aborted);
             try {
                 await replyRun.settle();
                 if (replyRun.signal.aborted) setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
